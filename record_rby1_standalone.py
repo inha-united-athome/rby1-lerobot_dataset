@@ -5,21 +5,37 @@ RBY1 SDK LeRobot 형식 데이터 로깅
 
 현재 로봇 상태(조인트 + 그리퍼 + 카메라)를 LeRobot 데이터셋 형식으로 기록합니다.
 
+=== 두 가지 모드 ===
+
+1. 관측 전용 모드 (기본, --teleop 없음):
+   - 로봇 제어권 없이 상태만 읽음
+   - SDK teleoperation과 동시 실행 가능
+   - 터미널 1: SDK teleoperation 실행 (로봇 제어)
+   - 터미널 2: 이 스크립트 실행 (녹화만)
+
+2. 텔레오퍼레이션 모드 (--teleop):
+   - 마스터 암으로 로봇을 직접 제어하며 녹화
+   - 제어권 획득, 그리퍼/마스터 암 초기화
+   - SDK teleoperation 없이 단독 실행
+
 키보드 조작:
     SPACE : 녹화 시작/중지 토글
     ENTER : 현재 에피소드 저장하고 다음 에피소드로
-    Q     : 종료
     R     : 현재 에피소드 취소하고 다시 녹화
+    B     : 이전 에피소드 삭제하고 재녹화
+    Q     : 종료
 
 사용 방법:
-    # 기본 모드 (observation.state = action)
+    # 관측 전용 모드 (SDK teleoperation과 함께 사용)
+    # 터미널 1: python rby1-sdk/examples/python/99_teleoperation_with_joint_mapping.py --address 192.168.30.1:50051
+    # 터미널 2:
     python record_rby1_standalone.py --address 192.168.30.1:50051 --episodes 10
 
-    # 텔레오퍼레이션 모드 (마스터 암에서 action 기록)
+    # 텔레오퍼레이션 모드 (단독 실행, 마스터 암으로 로봇 제어)
     python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --episodes 5
 
     # 카메라 포함
-    python record_rby1_standalone.py --address 192.168.30.1:50051 --camera 0 --teleop --episodes 5
+    python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --episodes 5
 """
 
 import argparse
@@ -52,8 +68,8 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 # 설정
 # ============================================================================
 
-# 에피소드당 최대 시간 (초) - 1분
-MAX_EPISODE_DURATION = 600
+# 에피소드당 최대 시간 (초) - 5분
+MAX_EPISODE_DURATION = 300
 
 # RBY1-A 조인트 이름 (팔별로 분리)
 RIGHT_ARM_JOINTS = [
@@ -65,6 +81,143 @@ LEFT_ARM_JOINTS = [
     "left_arm_0", "left_arm_1", "left_arm_2", "left_arm_3",
     "left_arm_4", "left_arm_5", "left_arm_6",
 ]
+
+
+# ============================================================================
+# 텔레오퍼레이션 설정 (SDK에서 가져옴)
+# ============================================================================
+
+class TeleopSettings:
+    """텔레오퍼레이션 설정"""
+    master_arm_loop_period = 1 / 100  # 100Hz
+    impedance_stiffness = 50
+    impedance_damping_ratio = 1.0
+    impedance_torque_limit = 30.0
+
+
+# 초기 자세 (모델별)
+READY_POSE = {
+    "A": {
+        "torso": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "right_arm": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    },
+    "M": {
+        "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
+        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+    },
+}
+
+# 마스터 암 관절 제한
+MA_Q_LIMIT_BARRIER = 0.5
+MA_MIN_Q = np.deg2rad([-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360])
+MA_MAX_Q = np.deg2rad([360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360])
+MA_TORQUE_LIMIT = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)
+MA_VISCOUS_GAIN = np.array([0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2)
+
+
+class Gripper:
+    """그리퍼 제어 클래스 (SDK에서 가져옴)"""
+    
+    def __init__(self):
+        self.bus = None
+        self.min_q = np.array([np.inf, np.inf])
+        self.max_q = np.array([-np.inf, -np.inf])
+        self.target_q = None
+        self._running = False
+        self._thread = None
+    
+    def initialize(self):
+        """그리퍼 초기화"""
+        try:
+            self.bus = rby.DynamixelBus(rby.upc.GripperDeviceName)
+            self.bus.open_port()
+            self.bus.set_baud_rate(2_000_000)
+            self.bus.set_torque_constant([1, 1])
+            
+            rv = True
+            for dev_id in [0, 1]:
+                if not self.bus.ping(dev_id):
+                    print(f"⚠ Dynamixel ID {dev_id} 응답 없음")
+                    rv = False
+            
+            if rv:
+                self.bus.group_sync_write_torque_enable([(dev_id, 1) for dev_id in [0, 1]])
+                print("✓ 그리퍼 초기화 완료")
+            return rv
+        except Exception as e:
+            print(f"⚠ 그리퍼 초기화 실패: {e}")
+            return False
+    
+    def set_operating_mode(self, mode):
+        """그리퍼 작동 모드 설정"""
+        if self.bus is None:
+            return
+        self.bus.group_sync_write_torque_enable([(dev_id, 0) for dev_id in [0, 1]])
+        self.bus.group_sync_write_operating_mode([(dev_id, mode) for dev_id in [0, 1]])
+        self.bus.group_sync_write_torque_enable([(dev_id, 1) for dev_id in [0, 1]])
+    
+    def homing(self):
+        """그리퍼 홈 위치 탐색"""
+        if self.bus is None:
+            return
+        self.set_operating_mode(rby.DynamixelBus.CurrentControlMode)
+        direction = 0
+        q = np.array([0, 0], dtype=np.float64)
+        prev_q = np.array([0, 0], dtype=np.float64)
+        counter = 0
+        
+        while direction < 2:
+            self.bus.group_sync_write_send_torque(
+                [(dev_id, 0.5 * (1 if direction == 0 else -1)) for dev_id in [0, 1]]
+            )
+            time.sleep(0.01)
+            q = np.array(self.bus.group_sync_read_present_position([0, 1]))
+            if np.allclose(q, prev_q, atol=1e-4):
+                counter += 1
+            else:
+                counter = 0
+            if counter > 100:
+                if direction == 0:
+                    self.min_q = q.copy()
+                else:
+                    self.max_q = q.copy()
+                direction += 1
+                counter = 0
+            prev_q = q.copy()
+        
+        self.target_q = self.max_q.copy()
+        self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
+        print(f"✓ 그리퍼 홈 완료 (범위: {self.min_q} ~ {self.max_q})")
+    
+    def set_target(self, target: np.ndarray):
+        """그리퍼 목표 위치 설정 (0-1 범위)"""
+        self.target_q = self.min_q + (self.max_q - self.min_q) * np.clip(target, 0, 1)
+    
+    def start(self):
+        """그리퍼 제어 스레드 시작"""
+        self._running = True
+        self._thread = threading.Thread(target=self._control_loop, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        """그리퍼 제어 스레드 정지"""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+    
+    def _control_loop(self):
+        """그리퍼 제어 루프"""
+        while self._running:
+            if self.bus and self.target_q is not None:
+                try:
+                    self.bus.group_sync_write_send_position(
+                        [(dev_id, self.target_q[dev_id]) for dev_id in [0, 1]]
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.02)  # 50Hz
 
 
 class KeyboardController:
@@ -120,6 +273,13 @@ class RBY1Recorder:
         self.master_arm = None
         self.master_arm_state = None
         self.master_arm_lock = threading.Lock()
+        
+        # 텔레오퍼레이션 관련
+        self.command_stream = None
+        self.gripper = None
+        self.right_q = None  # 오른팔 목표 위치
+        self.left_q = None   # 왼팔 목표 위치
+        self.robot_q = None  # 현재 로봇 관절 위치
 
         # 상태 데이터
         self.latest_state = None
@@ -185,6 +345,9 @@ class RBY1Recorder:
         """로봇 상태 업데이트 콜백"""
         with self.state_lock:
             self.latest_state = robot_state
+            # 텔레오퍼레이션용 로봇 관절 위치 업데이트
+            if robot_state is not None:
+                self.robot_q = np.array(robot_state.position)
 
     def connect(self):
         """로봇 및 카메라, 마스터 암 연결"""
@@ -197,12 +360,43 @@ class RBY1Recorder:
 
         print("✓ 로봇 연결됨")
 
-        # 파워 상태 확인 (필요시 파워온)
-        if not self.robot.is_power_on(".*"):
-            print("파워 온 중...")
-            if not self.robot.power_on(".*"):
-                raise RuntimeError("파워 온 실패")
-            print("✓ 파워 온 완료")
+        # 텔레오퍼레이션 모드: 제어권 획득
+        if self.use_teleop:
+            # 파워 상태 확인 (필요시 파워온)
+            if not self.robot.is_power_on(".*"):
+                print("파워 온 중...")
+                if not self.robot.power_on(".*"):
+                    raise RuntimeError("파워 온 실패")
+                print("✓ 파워 온 완료")
+            
+            # 서보 온
+            if not self.robot.is_servo_on("torso_.*|right_arm_.*|left_arm_.*"):
+                print("서보 온 중...")
+                if not self.robot.servo_on("torso_.*|right_arm_.*|left_arm_.*"):
+                    raise RuntimeError("서보 온 실패")
+                print("✓ 서보 온 완료")
+            
+            # Control Manager 활성화
+            self.robot.reset_fault_control_manager()
+            if not self.robot.enable_control_manager():
+                raise RuntimeError("Control Manager 활성화 실패")
+            print("✓ Control Manager 활성화")
+            
+            # 12V 출력 (그리퍼용)
+            for arm in ["right", "left"]:
+                if not self.robot.set_tool_flange_output_voltage(arm, 12):
+                    print(f"⚠ Tool flange 전압 설정 실패 ({arm})")
+            
+            # Command stream 생성
+            self.command_stream = self.robot.create_command_stream(priority=1)
+            print("✓ 텔레오퍼레이션 제어권 획득")
+        else:
+            # 관측 전용 모드: 제어권 없이 상태만 읽음
+            print("📡 관측 전용 모드 (제어권 없음)")
+            print("   → SDK teleoperation과 동시 실행 가능")
+            if not self.robot.is_power_on(".*"):
+                print("⚠ 로봇 파워가 꺼져 있습니다. SDK teleoperation을 먼저 실행하세요.")
+            self.command_stream = None
 
         # 상태 스트리밍 시작
         self.robot.start_state_update(self._state_callback, rate=100)
@@ -239,9 +433,9 @@ class RBY1Recorder:
         if self.camera_id is not None or self.use_realsense:
             self._connect_camera()
 
-        # 마스터 암 연결 (teleop 모드)
+        # 마스터 암 및 그리퍼 연결 (teleop 모드)
         if self.use_teleop:
-            self._connect_master_arm()
+            self._setup_teleop()
 
     def _connect_camera(self):
         """카메라 연결 (멀티 RealSense 또는 일반 USB 카메라)"""
@@ -314,44 +508,222 @@ class RBY1Recorder:
                 print("⚠ OpenCV 없음, 카메라 비활성화")
                 self.camera = None
 
-    def _connect_master_arm(self):
-        """마스터 암 연결 (텔레오퍼레이션용)"""
+    def _setup_teleop(self):
+        """완전한 텔레오퍼레이션 설정 (마스터 암 + 그리퍼 + 로봇 제어)"""
         try:
-            # UPC 장치 초기화
+            model_name = self.robot_model.model_name if self.robot_model else "A"
+            
+            # 로봇 관절 제한 가져오기
+            self.robot_max_q = self.dyn_robot.get_limit_q_upper(self.dyn_state)
+            self.robot_min_q = self.dyn_robot.get_limit_q_lower(self.dyn_state)
+            self.robot_max_qdot = self.dyn_robot.get_limit_qdot_upper(self.dyn_state)
+            self.robot_max_qddot = self.dyn_robot.get_limit_qddot_upper(self.dyn_state)
+            
+            # 초기 자세로 이동
+            print("초기 자세로 이동 중...")
+            ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
+            if not self._move_to_ready_pose(ready_pose):
+                print("⚠ 초기 자세 이동 실패")
+            else:
+                print("✓ 초기 자세 완료")
+            
+            # 그리퍼 초기화
+            self.gripper = Gripper()
+            if self.gripper.initialize():
+                self.gripper.homing()
+                self.gripper.start()
+            else:
+                print("⚠ 그리퍼 없이 진행")
+                self.gripper = None
+            
+            # 마스터 암 초기화
             rby.upc.initialize_device(rby.upc.MasterArmDeviceName)
             
-            # 마스터 암 모델 경로
             sdk_path = Path(__file__).parent / "rby1-sdk"
             if not sdk_path.exists():
                 sdk_path = Path.home() / "vla_ws" / "rby1-sdk"
             master_arm_model = str(sdk_path / "models" / "master_arm" / "model.urdf")
             
-            # 마스터 암 초기화
             self.master_arm = rby.upc.MasterArm(rby.upc.MasterArmDeviceName)
             self.master_arm.set_model_path(master_arm_model)
-            self.master_arm.set_control_period(0.01)  # 100Hz
+            self.master_arm.set_control_period(TeleopSettings.master_arm_loop_period)
             
             active_ids = self.master_arm.initialize(verbose=False)
             if len(active_ids) != rby.upc.MasterArm.DeviceCount:
-                print(f"⚠ 마스터 암 장치 수 불일치 (감지: {len(active_ids)}/{rby.upc.MasterArm.DeviceCount})")
-                self.master_arm = None
-                return
+                raise RuntimeError(f"마스터 암 장치 수 불일치 ({len(active_ids)}/{rby.upc.MasterArm.DeviceCount})")
             
-            # 마스터 암 상태 콜백 시작
-            def master_arm_callback(state):
-                with self.master_arm_lock:
-                    self.master_arm_state = state
+            # 초기 목표 위치 설정
+            self.right_q = None
+            self.left_q = None
+            self.right_minimum_time = 1.0
+            self.left_minimum_time = 1.0
             
-            self.master_arm.start_control(master_arm_callback)
-            print("✓ 마스터 암 연결됨 (텔레오퍼레이션 모드)")
+            # 마스터 암 제어 루프 시작
+            self.master_arm.start_control(self._master_arm_control_loop)
+            print("✓ 텔레오퍼레이션 준비 완료 (마스터 암 버튼으로 제어)")
+            print("   → 버튼 누르면 해당 팔 제어 활성화")
             
         except AttributeError as e:
-            print(f"⚠ 마스터 암 연결 실패: UPC 기능 없음 ({e})")
+            print(f"⚠ 텔레오퍼레이션 설정 실패: UPC 기능 없음 ({e})")
             print("  → 이 기능은 UPC(Ubuntu PC)에서만 사용 가능합니다.")
             self.master_arm = None
         except Exception as e:
-            print(f"⚠ 마스터 암 연결 실패: {e}")
+            print(f"⚠ 텔레오퍼레이션 설정 실패: {e}")
             self.master_arm = None
+    
+    def _move_to_ready_pose(self, pose: dict, minimum_time: float = 5.0) -> bool:
+        """초기 자세로 이동"""
+        try:
+            # Joint position command 빌더
+            torso_builder = (
+                rby.JointPositionCommandBuilder()
+                .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+                .set_position(pose["torso"])
+                .set_minimum_time(minimum_time)
+            )
+            right_arm_builder = (
+                rby.JointPositionCommandBuilder()
+                .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+                .set_position(pose["right_arm"])
+                .set_minimum_time(minimum_time)
+            )
+            left_arm_builder = (
+                rby.JointPositionCommandBuilder()
+                .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+                .set_position(pose["left_arm"])
+                .set_minimum_time(minimum_time)
+            )
+            
+            cmd = rby.RobotCommandBuilder().set_command(
+                rby.ComponentBasedCommandBuilder().set_body_command(
+                    rby.BodyComponentBasedCommandBuilder()
+                    .set_torso_command(torso_builder)
+                    .set_right_arm_command(right_arm_builder)
+                    .set_left_arm_command(left_arm_builder)
+                )
+            )
+            
+            handler = self.robot.send_command(cmd)
+            return handler.get() == rby.RobotCommandFeedback.FinishCode.Ok
+        except Exception as e:
+            print(f"⚠ 초기 자세 이동 오류: {e}")
+            return False
+    
+    def _master_arm_control_loop(self, state):
+        """마스터 암 제어 콜백 - 로봇을 실시간으로 제어"""
+        # 현재 상태 저장 (녹화용)
+        with self.master_arm_lock:
+            self.master_arm_state = state
+        
+        # 로봇 관절 위치가 없으면 대기
+        if self.robot_q is None:
+            with self.state_lock:
+                if self.latest_state is not None:
+                    self.robot_q = np.array(self.latest_state.position)
+            return rby.upc.MasterArm.ControlInput()
+        
+        # 초기 목표 위치 설정
+        if self.right_q is None:
+            self.right_q = np.array(state.q_joint[0:7])
+        if self.left_q is None:
+            self.left_q = np.array(state.q_joint[7:14])
+        
+        ma_input = rby.upc.MasterArm.ControlInput()
+        
+        # 그리퍼 제어
+        if self.gripper:
+            self.gripper.set_target(np.array([
+                state.button_right.trigger / 1000.0,
+                state.button_left.trigger / 1000.0
+            ]))
+        
+        # 마스터 암 토크 계산
+        torque = (
+            state.gravity_term
+            + MA_Q_LIMIT_BARRIER * (
+                np.maximum(MA_MIN_Q - state.q_joint, 0)
+                + np.minimum(MA_MAX_Q - state.q_joint, 0)
+            )
+            + MA_VISCOUS_GAIN * state.qvel_joint
+        )
+        torque = np.clip(torque, -MA_TORQUE_LIMIT, MA_TORQUE_LIMIT)
+        
+        # 오른팔 마스터 암 제어
+        if state.button_right.button == 1:
+            ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
+            ma_input.target_torque[0:7] = torque[0:7] * 0.6
+            self.right_q = np.array(state.q_joint[0:7])
+        else:
+            ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
+            ma_input.target_torque[0:7] = MA_TORQUE_LIMIT[0:7]
+            ma_input.target_position[0:7] = self.right_q
+        
+        # 왼팔 마스터 암 제어
+        if state.button_left.button == 1:
+            ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
+            ma_input.target_torque[7:14] = torque[7:14] * 0.6
+            self.left_q = np.array(state.q_joint[7:14])
+        else:
+            ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
+            ma_input.target_torque[7:14] = MA_TORQUE_LIMIT[7:14]
+            ma_input.target_position[7:14] = self.left_q
+        
+        # 충돌 체크
+        q = self.robot_q.copy()
+        q[self.robot_model.right_arm_idx] = self.right_q
+        q[self.robot_model.left_arm_idx] = self.left_q
+        self.dyn_state.set_q(q)
+        self.dyn_robot.compute_forward_kinematics(self.dyn_state)
+        is_collision = self.dyn_robot.detect_collisions_or_nearest_links(self.dyn_state, 1)[0].distance < 0.02
+        
+        # 로봇 명령 빌드
+        rc = rby.BodyComponentBasedCommandBuilder()
+        
+        if state.button_right.button and not is_collision:
+            self.right_minimum_time -= TeleopSettings.master_arm_loop_period
+            self.right_minimum_time = max(self.right_minimum_time, TeleopSettings.master_arm_loop_period * 1.01)
+            
+            right_arm_builder = rby.JointPositionCommandBuilder()
+            (
+                right_arm_builder
+                .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+                .set_position(np.clip(self.right_q, self.robot_min_q[self.robot_model.right_arm_idx], 
+                                      self.robot_max_q[self.robot_model.right_arm_idx]))
+                .set_velocity_limit(self.robot_max_qdot[self.robot_model.right_arm_idx])
+                .set_acceleration_limit(self.robot_max_qddot[self.robot_model.right_arm_idx] * 30)
+                .set_minimum_time(self.right_minimum_time)
+            )
+            rc.set_right_arm_command(right_arm_builder)
+        else:
+            self.right_minimum_time = 0.8
+        
+        if state.button_left.button and not is_collision:
+            self.left_minimum_time -= TeleopSettings.master_arm_loop_period
+            self.left_minimum_time = max(self.left_minimum_time, TeleopSettings.master_arm_loop_period * 1.01)
+            
+            left_arm_builder = rby.JointPositionCommandBuilder()
+            (
+                left_arm_builder
+                .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+                .set_position(np.clip(self.left_q, self.robot_min_q[self.robot_model.left_arm_idx],
+                                      self.robot_max_q[self.robot_model.left_arm_idx]))
+                .set_velocity_limit(self.robot_max_qdot[self.robot_model.left_arm_idx])
+                .set_acceleration_limit(self.robot_max_qddot[self.robot_model.left_arm_idx] * 30)
+                .set_minimum_time(self.left_minimum_time)
+            )
+            rc.set_left_arm_command(left_arm_builder)
+        else:
+            self.left_minimum_time = 0.8
+        
+        # 로봇에 명령 전송
+        if self.command_stream:
+            self.command_stream.send_command(
+                rby.RobotCommandBuilder().set_command(
+                    rby.ComponentBasedCommandBuilder().set_body_command(rc)
+                )
+            )
+        
+        return ma_input
 
     def get_master_arm_action(self) -> dict | None:
         """마스터 암에서 action 값 가져오기"""
@@ -397,11 +769,30 @@ class RBY1Recorder:
 
     def disconnect(self):
         """연결 해제"""
+        # 그리퍼 해제
+        if self.gripper is not None:
+            try:
+                self.gripper.stop()
+                print("✓ 그리퍼 연결 해제")
+            except Exception:
+                pass
+        
         # 마스터 암 해제
         if self.master_arm is not None:
             try:
                 self.master_arm.stop_control()
                 print("✓ 마스터 암 연결 해제")
+            except Exception:
+                pass
+        
+        # 텔레오퍼레이션 모드: 제어권 해제
+        if self.use_teleop and self.robot:
+            try:
+                self.robot.cancel_control()
+                time.sleep(0.3)
+                self.robot.disable_control_manager()
+                self.robot.power_off("12v")
+                print("✓ 제어권 해제")
             except Exception:
                 pass
         
@@ -735,7 +1126,8 @@ class RBY1Recorder:
         print("\n키보드 조작:")
         print("  [SPACE] 녹화 시작/일시정지")
         print("  [ENTER] 에피소드 저장 & 다음으로")
-        print("  [R]     에피소드 취소 & 다시 녹화")
+        print("  [R]     현재 에피소드 취소 & 다시 녹화")
+        print("  [B]     이전 에피소드 삭제 & 재녹화")
         print("  [Q]     종료")
         print("=" * 60)
 
@@ -761,11 +1153,14 @@ class RBY1Recorder:
         frame_interval = 1.0 / fps
         episode_idx = 0
         total_frames = 0
+        episode_frame_counts = []  # 각 에피소드별 프레임 수 저장
 
         with KeyboardController() as keyboard:
             while episode_idx < num_episodes:
                 print(f"\n{'='*60}")
                 print(f"에피소드 {episode_idx + 1}/{num_episodes}")
+                if episode_idx > 0:
+                    print(f"(이전 에피소드 재녹화: [B] 키)")
                 print(f"{'='*60}")
                 print("SPACE를 눌러 녹화를 시작하세요...")
 
@@ -799,13 +1194,40 @@ class RBY1Recorder:
                             else:
                                 print("\n⚠ 녹화된 프레임이 없습니다!")
 
-                        elif key.lower() == 'r':  # R - 에피소드 취소
+                        elif key.lower() == 'r':  # R - 현재 에피소드 취소
                             if frame_count > 0:
                                 episode_cancelled = True
                                 episode_done = True
-                                print("\n✗ 에피소드 취소됨")
+                                print("\n✗ 현재 에피소드 취소됨")
                             else:
                                 print("\n취소할 녹화가 없습니다.")
+
+                        elif key.lower() == 'b':  # B - 이전 에피소드 재녹화
+                            if episode_idx > 0:
+                                # 확인 절차
+                                print(f"\n⚠ 에피소드 {episode_idx}을(를) 삭제하고 재녹화할까요? (y/n): ", end="", flush=True)
+                                confirm_key = keyboard.get_key(timeout=10)
+                                if confirm_key and confirm_key.lower() == 'y':
+                                    # 현재 녹화 중인 데이터 취소
+                                    if frame_count > 0:
+                                        dataset.clear_episode_buffer()
+                                        print(f"현재 에피소드 {episode_idx + 1} 버퍼 삭제됨")
+                                    
+                                    # 이전 에피소드 삭제
+                                    try:
+                                        dataset.delete_episode(episode_idx - 1)
+                                        prev_frames = episode_frame_counts.pop()
+                                        total_frames -= prev_frames
+                                        episode_idx -= 1
+                                        print(f"◀ 에피소드 {episode_idx + 1} 삭제됨 ({prev_frames} 프레임). 재녹화합니다...")
+                                        episode_done = True
+                                        episode_cancelled = True  # 현재 루프 종료, 다시 시작
+                                    except Exception as e:
+                                        print(f"\n⚠ 이전 에피소드 삭제 실패: {e}")
+                                else:
+                                    print("취소됨.")
+                            else:
+                                print("\n⚠ 첫 번째 에피소드입니다. 이전 에피소드가 없습니다.")
 
                         elif key.lower() == 'q':  # Q - 종료
                             print("\n종료합니다...")
@@ -947,10 +1369,12 @@ class RBY1Recorder:
 
                 # 에피소드 완료 처리
                 if episode_cancelled:
-                    dataset.clear_episode_buffer()
+                    if frame_count > 0:  # 현재 녹화 버퍼가 있으면 삭제
+                        dataset.clear_episode_buffer()
                     print(f"에피소드 {episode_idx + 1} 취소됨. 다시 녹화합니다.")
                 else:
                     dataset.save_episode()
+                    episode_frame_counts.append(frame_count)  # 프레임 수 저장
                     total_frames += frame_count
                     print(f"✓ 에피소드 {episode_idx + 1} 저장 완료! ({frame_count} 프레임)")
                     episode_idx += 1
