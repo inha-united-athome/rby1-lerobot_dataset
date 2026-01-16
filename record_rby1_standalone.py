@@ -25,6 +25,11 @@ RBY1 SDK LeRobot 형식 데이터 로깅
     B     : 이전 에피소드 삭제하고 재녹화
     Q     : 종료
 
+    헤드 제어 (teleop 모드에서만):
+    W/S   : 헤드 위/아래 (tilt)
+    A/D   : 헤드 좌/우 (pan)
+    X     : 헤드 중앙으로 리셋
+
 사용 방법:
     # 관측 전용 모드 (SDK teleoperation과 함께 사용)
     # 터미널 1: python rby1-sdk/examples/python/99_teleoperation_with_joint_mapping.py --address 192.168.30.1:50051
@@ -49,6 +54,7 @@ import tty
 import select
 from pathlib import Path
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
 
@@ -82,6 +88,12 @@ LEFT_ARM_JOINTS = [
     "left_arm_4", "left_arm_5", "left_arm_6",
 ]
 
+# [개발중] 휠 조인트 이름
+WHEEL_JOINTS = [
+    "wheel_0",  # 왼쪽 휠
+    "wheel_1",  # 오른쪽 휠
+]
+
 
 # ============================================================================
 # 텔레오퍼레이션 설정 (SDK에서 가져옴)
@@ -94,13 +106,28 @@ class TeleopSettings:
     impedance_damping_ratio = 1.0
     impedance_torque_limit = 30.0
 
+#Ready:"torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
+#Packing:"torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
+
+#right_arm=np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+#left_arm=np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+
+#중간허리 np.deg2rad([0.0, 55.0, -110.0, 50.0, 0.0, 0.0]
+
+#전투모드
+#torso = np.array([0.0,1.1839635825151906,-1.4456515921713253,0.5552402935002304,0.0,0.0,])
+#right_arm = np.array([-0.015897964254646485,-1.6672738461993182,-0.3115309943159733,-1.1695426443162062,0.7229574754265632,-1.3463979472390455,0.0,])
+#left_arm = np.array([0.00019364608955982105,1.679986142431598,0.3165619956623804,-1.1723713960166389,-0.7150267947531944,-1.271152354641285,0.0,])
 
 # 초기 자세 (모델별)
 READY_POSE = {
     "A": {
-        "torso": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        "right_arm": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        "left_arm": np.deg2rad([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        "torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
+        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0] ),
+        #"torso": np.array([0.0,1.1839635825151906,-1.4456515921713253,0.5552402935002304,0.0,0.0,]),
+        #"right_arm": np.array([-0.015897964254646485,-1.6672738461993182,-0.3115309943159733,-1.1695426443162062,0.7229574754265632,-1.3463979472390455,0.0,]),
+        #"left_arm": np.array([0.00019364608955982105,1.679986142431598,0.3165619956623804,-1.1723713960166389,-0.7150267947531944,-1.271152354641285,0.0,]),
     },
     "M": {
         "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
@@ -172,20 +199,20 @@ class Gripper:
             self.bus.group_sync_write_send_torque(
                 [(dev_id, 0.5 * (1 if direction == 0 else -1)) for dev_id in [0, 1]]
             )
-            time.sleep(0.01)
-            q = np.array(self.bus.group_sync_read_present_position([0, 1]))
-            if np.allclose(q, prev_q, atol=1e-4):
+            # 99_teleoperation과 동일하게 group_fast_sync_read_encoder 사용
+            rv = self.bus.group_fast_sync_read_encoder([0, 1])
+            if rv is not None:
+                for dev_id, enc in rv:
+                    q[dev_id] = enc
+            self.min_q = np.minimum(self.min_q, q)
+            self.max_q = np.maximum(self.max_q, q)
+            if np.array_equal(prev_q, q):
                 counter += 1
-            else:
-                counter = 0
-            if counter > 100:
-                if direction == 0:
-                    self.min_q = q.copy()
-                else:
-                    self.max_q = q.copy()
+            prev_q = q.copy()
+            if counter >= 30:
                 direction += 1
                 counter = 0
-            prev_q = q.copy()
+            time.sleep(0.1)
         
         self.target_q = self.max_q.copy()
         self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -208,16 +235,18 @@ class Gripper:
             self._thread.join(timeout=1.0)
     
     def _control_loop(self):
-        """그리퍼 제어 루프"""
+        """그리퍼 제어 루프 (99_teleoperation과 동일)"""
+        self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
+        self.bus.group_sync_write_send_torque([(dev_id, 5) for dev_id in [0, 1]])
         while self._running:
             if self.bus and self.target_q is not None:
                 try:
                     self.bus.group_sync_write_send_position(
-                        [(dev_id, self.target_q[dev_id]) for dev_id in [0, 1]]
+                        [(dev_id, q) for dev_id, q in enumerate(self.target_q.tolist())]
                     )
                 except Exception:
                     pass
-            time.sleep(0.02)  # 50Hz
+            time.sleep(0.1)  # 10Hz (99_teleoperation과 동일)
 
 
 class KeyboardController:
@@ -248,13 +277,20 @@ class RBY1Recorder:
 
     def __init__(self, address: str, model: str = "a", camera_id: int | None = None, 
                  arms: str = "both", use_realsense: bool = False, use_teleop: bool = False,
-                 camera_names: list[str] | None = None):
+                 camera_names: list[str] | None = None, stream_port: int = 0,
+                 control_mode: str = "impedance", reset_pose: bool = True,
+                 use_wheels: bool = False):
         self.address = address
         self.model = model
         self.camera_id = camera_id
         self.arms = arms
         self.use_realsense = use_realsense
         self.use_teleop = use_teleop
+        self.stream_port = stream_port  # 웹 스트리밍 포트 (0이면 비활성화)
+        self.control_mode = control_mode  # 'position' 또는 'impedance'
+        self.position_mode = (control_mode == "position")
+        self.reset_pose_each_episode = reset_pose  # 에피소드마다 초기 자세로 리셋
+        self.use_wheels = use_wheels  # [개발중] 휠 데이터 기록 여부
         
         # 카메라 이름 설정: arms에 따라 기본값 결정
         if camera_names is not None:
@@ -264,6 +300,11 @@ class RBY1Recorder:
 
         self.robot = None
         self.camera = None
+        
+        # 웹 스트리밍 관련
+        self.stream_server = None
+        self.stream_frames = {}  # {camera_name: frame}
+        self.stream_lock = threading.Lock()
         
         # 멀티 RealSense 카메라 지원
         self.rs_pipelines = {}  # {camera_name: (pipeline, serial)}
@@ -280,6 +321,14 @@ class RBY1Recorder:
         self.right_q = None  # 오른팔 목표 위치
         self.left_q = None   # 왼팔 목표 위치
         self.robot_q = None  # 현재 로봇 관절 위치
+        
+        # 헤드 제어 관련
+        self.head_q = np.array([0.0, 0.0])  # [pan (head_0), tilt (head_1)]
+        self.head_limits = {
+            'pan': (-0.523, 0.523),    # head_0: -30° ~ 30°
+            'tilt': (-0.35, 1.57),     # head_1: -20° ~ 90°
+        }
+        self.head_step = np.deg2rad(5.0)  # 키 한번에 5도 이동
 
         # 상태 데이터
         self.latest_state = None
@@ -333,13 +382,19 @@ class RBY1Recorder:
     def _get_joint_names(self, arms: str) -> list[str]:
         """선택한 팔에 따른 조인트 이름 반환"""
         if arms == "right":
-            return RIGHT_ARM_JOINTS.copy()
+            joints = RIGHT_ARM_JOINTS.copy()
         elif arms == "left":
-            return LEFT_ARM_JOINTS.copy()
+            joints = LEFT_ARM_JOINTS.copy()
         elif arms == "both":
-            return RIGHT_ARM_JOINTS + LEFT_ARM_JOINTS
+            joints = RIGHT_ARM_JOINTS + LEFT_ARM_JOINTS
         else:
             raise ValueError(f"Invalid arms option: {arms}. Use 'right', 'left', or 'both'")
+        
+        # [개발중] 휠 조인트 추가
+        if self.use_wheels:
+            joints = joints + WHEEL_JOINTS
+        
+        return joints
 
     def _state_callback(self, robot_state, control_manager_state=None):
         """로봇 상태 업데이트 콜백"""
@@ -369,12 +424,13 @@ class RBY1Recorder:
                     raise RuntimeError("파워 온 실패")
                 print("✓ 파워 온 완료")
             
-            # 서보 온
-            if not self.robot.is_servo_on("torso_.*|right_arm_.*|left_arm_.*"):
+            # 서보 온 (팔 + 헤드)
+            servo_pattern = "torso_.*|right_arm_.*|left_arm_.*|head_.*"
+            if not self.robot.is_servo_on(servo_pattern):
                 print("서보 온 중...")
-                if not self.robot.servo_on("torso_.*|right_arm_.*|left_arm_.*"):
+                if not self.robot.servo_on(servo_pattern):
                     raise RuntimeError("서보 온 실패")
-                print("✓ 서보 온 완료")
+                print("✓ 서보 온 완료 (팔 + 헤드)")
             
             # Control Manager 활성화
             self.robot.reset_fault_control_manager()
@@ -433,9 +489,161 @@ class RBY1Recorder:
         if self.camera_id is not None or self.use_realsense:
             self._connect_camera()
 
+        # 웹 스트리밍 서버 시작
+        if self.stream_port > 0:
+            self._start_stream_server()
+
         # 마스터 암 및 그리퍼 연결 (teleop 모드)
         if self.use_teleop:
             self._setup_teleop()
+
+    def _start_stream_server(self):
+        """웹 스트리밍 서버 시작 (MJPEG 멀티스레드)"""
+        recorder = self
+        from socketserver import ThreadingMixIn
+        import cv2
+        
+        class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+        
+        class StreamHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/':
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    
+                    # 연결된 카메라 목록으로 HTML 생성 (rs_pipelines에서 가져옴)
+                    camera_divs = ""
+                    cam_names = list(recorder.rs_pipelines.keys()) if recorder.rs_pipelines else []
+                    
+                    # rs_pipelines가 없으면 stream_frames에서 가져옴
+                    if not cam_names:
+                        with recorder.stream_lock:
+                            cam_names = list(recorder.stream_frames.keys())
+                    
+                    for cam_name in cam_names:
+                        camera_divs += f'''
+                        <div class="camera">
+                            <h3>{cam_name}</h3>
+                            <img src="/{cam_name}.mjpeg" width="640">
+                        </div>
+                        '''
+                    
+                    if not camera_divs:
+                        camera_divs = '<p style="color: #ff9800;">카메라가 연결되지 않았습니다.</p>'
+                    
+                    html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RBY1 Camera Stream</title>
+    <style>
+        body {{ 
+            font-family: Arial, sans-serif; 
+            background: #1e1e1e; 
+            color: white;
+            margin: 20px;
+        }}
+        h1 {{ color: #4fc3f7; }}
+        .status {{ 
+            background: #2d2d2d; 
+            padding: 10px 20px; 
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: inline-block;
+        }}
+        .container {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+        .camera {{ 
+            background: #2d2d2d; 
+            padding: 10px; 
+            border-radius: 8px;
+        }}
+        .camera h3 {{ margin: 0 0 10px 0; color: #81c784; }}
+        img {{ max-width: 100%; border-radius: 4px; }}
+    </style>
+</head>
+<body>
+    <h1>🎥 RBY1 Camera Stream</h1>
+    <div class="status">📡 MJPEG Streaming at {recorder.stream_port}</div>
+    <div class="container">
+        {camera_divs}
+    </div>
+</body>
+</html>
+                    '''
+                    self.wfile.write(html.encode())
+                    
+                elif self.path.endswith('.mjpeg'):
+                    # MJPEG 스트리밍
+                    cam_name = self.path[1:].replace('.mjpeg', '')
+                    
+                    self.send_response(200)
+                    self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+                    self.end_headers()
+                    
+                    try:
+                        while True:
+                            with recorder.stream_lock:
+                                frame = recorder.stream_frames.get(cam_name)
+                            
+                            if frame is not None:
+                                # RGB -> BGR for encoding
+                                if len(frame.shape) == 3 and frame.shape[2] == 3:
+                                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                                else:
+                                    frame_bgr = frame
+                                _, buffer = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                
+                                self.wfile.write(b'--frame\r\n')
+                                self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n')
+                                self.wfile.write(buffer.tobytes())
+                                self.wfile.write(b'\r\n')
+                            
+                            time.sleep(0.033)  # ~30fps
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            
+            def log_message(self, format, *args):
+                pass  # 로그 숨기기
+        
+        def run_server():
+            server = ThreadingHTTPServer(('0.0.0.0', recorder.stream_port), StreamHandler)
+            recorder.stream_server = server
+            server.serve_forever()
+        
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        
+        # 스트리밍용 카메라 캡처 스레드 시작 (각 카메라별 별도 스레드)
+        self._stream_running = True
+        self._stream_capture_threads = []
+        
+        def stream_capture_loop(cam_name, pipeline):
+            """각 카메라별 캡처 루프"""
+            import pyrealsense2 as rs
+            while self._stream_running:
+                try:
+                    frames = pipeline.wait_for_frames(timeout_ms=100)
+                    color_frame = frames.get_color_frame()
+                    if color_frame:
+                        frame_rgb = np.asanyarray(color_frame.get_data())
+                        with self.stream_lock:
+                            self.stream_frames[cam_name] = frame_rgb.copy()
+                except:
+                    pass
+                time.sleep(0.01)  # ~100fps max to reduce latency
+        
+        # 각 카메라에 대해 별도 스레드 시작
+        for cam_name, (pipeline, _) in self.rs_pipelines.items():
+            t = threading.Thread(target=stream_capture_loop, args=(cam_name, pipeline), daemon=True)
+            t.start()
+            self._stream_capture_threads.append(t)
+        
+        print(f"🌐 카메라 스트리밍: http://localhost:{self.stream_port}")
 
     def _connect_camera(self):
         """카메라 연결 (멀티 RealSense 또는 일반 USB 카메라)"""
@@ -519,13 +727,19 @@ class RBY1Recorder:
             self.robot_max_qdot = self.dyn_robot.get_limit_qdot_upper(self.dyn_state)
             self.robot_max_qddot = self.dyn_robot.get_limit_qddot_upper(self.dyn_state)
             
-            # 초기 자세로 이동
+            # Impedance 모드: 손목 관절 속도 제한 증가 (17_teleoperation과 동일)
+            if not self.position_mode:
+                self.robot_max_qdot[self.robot_model.right_arm_idx[-1]] *= 10
+                self.robot_max_qdot[self.robot_model.left_arm_idx[-1]] *= 10
+                print(f"✓ Impedance 모드 활성화 (stiffness={TeleopSettings.impedance_stiffness})")
+            else:
+                print("✓ Position 모드 활성화")
+            
+            # 초기 자세로 이동 (command_stream 사용)
             print("초기 자세로 이동 중...")
             ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
-            if not self._move_to_ready_pose(ready_pose):
-                print("⚠ 초기 자세 이동 실패")
-            else:
-                print("✓ 초기 자세 완료")
+            self._send_ready_pose_stream(ready_pose)
+            print("✓ 초기 자세 명령 전송 완료")
             
             # 그리퍼 초기화
             self.gripper = Gripper()
@@ -571,8 +785,122 @@ class RBY1Recorder:
             print(f"⚠ 텔레오퍼레이션 설정 실패: {e}")
             self.master_arm = None
     
-    def _move_to_ready_pose(self, pose: dict, minimum_time: float = 5.0) -> bool:
-        """초기 자세로 이동"""
+    def _send_ready_pose_stream(self, pose: dict, minimum_time: float = 5.0):
+        """초기 자세로 이동 (command_stream 사용, 비블로킹)"""
+        if self.command_stream is None:
+            return
+        
+        # Position 또는 Impedance 모드에 따른 빌더 선택
+        torso_builder = (
+            rby.JointPositionCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+            .set_position(pose["torso"])
+            .set_minimum_time(minimum_time)
+        )
+        
+        # 오른팔 빌더
+        right_arm_builder = (
+            rby.JointPositionCommandBuilder()
+            if self.position_mode
+            else rby.JointImpedanceControlCommandBuilder()
+        )
+        (
+            right_arm_builder
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+            .set_position(pose["right_arm"])
+            .set_minimum_time(minimum_time)
+        )
+        if not self.position_mode:
+            (
+                right_arm_builder
+                .set_stiffness([TeleopSettings.impedance_stiffness] * 7)
+                .set_damping_ratio(TeleopSettings.impedance_damping_ratio)
+                .set_torque_limit([TeleopSettings.impedance_torque_limit] * 7)
+            )
+        
+        # 왼팔 빌더
+        left_arm_builder = (
+            rby.JointPositionCommandBuilder()
+            if self.position_mode
+            else rby.JointImpedanceControlCommandBuilder()
+        )
+        (
+            left_arm_builder
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
+            .set_position(pose["left_arm"])
+            .set_minimum_time(minimum_time)
+        )
+        if not self.position_mode:
+            (
+                left_arm_builder
+                .set_stiffness([TeleopSettings.impedance_stiffness] * 7)
+                .set_damping_ratio(TeleopSettings.impedance_damping_ratio)
+                .set_torque_limit([TeleopSettings.impedance_torque_limit] * 7)
+            )
+        
+        cmd = rby.RobotCommandBuilder().set_command(
+            rby.ComponentBasedCommandBuilder().set_body_command(
+                rby.BodyComponentBasedCommandBuilder()
+                .set_torso_command(torso_builder)
+                .set_right_arm_command(right_arm_builder)
+                .set_left_arm_command(left_arm_builder)
+            )
+        )
+        
+        self.command_stream.send_command(cmd)
+    
+    def move_to_ready_pose(self, wait_time: float = 3.0):
+        """초기 자세로 이동 (에피소드 시작시 호출)
+        
+        Args:
+            wait_time: 이동 완료 대기 시간 (초)
+        """
+        if not self.use_teleop or self.command_stream is None:
+            return
+        
+        model_name = self.robot_model.model_name if self.robot_model else "A"
+        ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
+        
+        print("\n🔄 초기 자세로 이동 중...")
+        self._send_ready_pose_stream(ready_pose, minimum_time=2.0)
+        
+        # 이동 완료 대기
+        time.sleep(wait_time)
+        
+        # 마스터 암 목표 위치도 초기화
+        if self.master_arm is not None:
+            self.right_q = ready_pose["right_arm"].copy()
+            self.left_q = ready_pose["left_arm"].copy()
+            self.right_minimum_time = 1.0
+            self.left_minimum_time = 1.0
+        
+        print("✓ 초기 자세 완료")
+    
+    def move_head(self, direction: str):
+        """헤드 이동 (키보드 제어) - 즉시 명령 전송
+        
+        Args:
+            direction: 'up', 'down', 'left', 'right', 'center'
+        """
+        # 방향에 따라 헤드 위치 업데이트
+        if direction == 'up':
+            self.head_q[1] -= self.head_step  # tilt 감소 (위로)
+        elif direction == 'down':
+            self.head_q[1] += self.head_step  # tilt 증가 (아래로)
+        elif direction == 'left':
+            self.head_q[0] += self.head_step  # pan 증가 (왼쪽)
+        elif direction == 'right':
+            self.head_q[0] -= self.head_step  # pan 감소 (오른쪽)
+        elif direction == 'center':
+            self.head_q = np.array([0.0, 0.0])  # 중앙으로 리셋
+        
+        # 제한 범위 적용
+        self.head_q[0] = np.clip(self.head_q[0], *self.head_limits['pan'])
+        self.head_q[1] = np.clip(self.head_q[1], *self.head_limits['tilt'])
+        # 마스터 암 루프에서 100Hz로 head_q 값을 command_stream으로 전송함
+    
+    def _move_to_ready_pose(self, pose: dict, minimum_time: float = 5.0, timeout: float = 10.0) -> bool:
+        """초기 자세로 이동 (타임아웃 포함)"""
         try:
             # Joint position command 빌더
             torso_builder = (
@@ -604,7 +932,17 @@ class RBY1Recorder:
             )
             
             handler = self.robot.send_command(cmd)
-            return handler.get() == rby.RobotCommandFeedback.FinishCode.Ok
+            
+            # 타임아웃 적용하여 대기
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(handler.get)
+                try:
+                    result = future.result(timeout=timeout)
+                    return result == rby.RobotCommandFeedback.FinishCode.Ok
+                except concurrent.futures.TimeoutError:
+                    print(f"⚠ 초기 자세 이동 타임아웃 ({timeout}초) - 현재 위치에서 시작")
+                    return False
         except Exception as e:
             print(f"⚠ 초기 자세 이동 오류: {e}")
             return False
@@ -683,7 +1021,12 @@ class RBY1Recorder:
             self.right_minimum_time -= TeleopSettings.master_arm_loop_period
             self.right_minimum_time = max(self.right_minimum_time, TeleopSettings.master_arm_loop_period * 1.01)
             
-            right_arm_builder = rby.JointPositionCommandBuilder()
+            # Position 또는 Impedance 모드 선택
+            right_arm_builder = (
+                rby.JointPositionCommandBuilder()
+                if self.position_mode
+                else rby.JointImpedanceControlCommandBuilder()
+            )
             (
                 right_arm_builder
                 .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
@@ -693,6 +1036,14 @@ class RBY1Recorder:
                 .set_acceleration_limit(self.robot_max_qddot[self.robot_model.right_arm_idx] * 30)
                 .set_minimum_time(self.right_minimum_time)
             )
+            # Impedance 모드 추가 설정
+            if not self.position_mode:
+                (
+                    right_arm_builder
+                    .set_stiffness([TeleopSettings.impedance_stiffness] * len(self.robot_model.right_arm_idx))
+                    .set_damping_ratio(TeleopSettings.impedance_damping_ratio)
+                    .set_torque_limit([TeleopSettings.impedance_torque_limit] * len(self.robot_model.right_arm_idx))
+                )
             rc.set_right_arm_command(right_arm_builder)
         else:
             self.right_minimum_time = 0.8
@@ -701,7 +1052,12 @@ class RBY1Recorder:
             self.left_minimum_time -= TeleopSettings.master_arm_loop_period
             self.left_minimum_time = max(self.left_minimum_time, TeleopSettings.master_arm_loop_period * 1.01)
             
-            left_arm_builder = rby.JointPositionCommandBuilder()
+            # Position 또는 Impedance 모드 선택
+            left_arm_builder = (
+                rby.JointPositionCommandBuilder()
+                if self.position_mode
+                else rby.JointImpedanceControlCommandBuilder()
+            )
             (
                 left_arm_builder
                 .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
@@ -711,17 +1067,35 @@ class RBY1Recorder:
                 .set_acceleration_limit(self.robot_max_qddot[self.robot_model.left_arm_idx] * 30)
                 .set_minimum_time(self.left_minimum_time)
             )
+            # Impedance 모드 추가 설정
+            if not self.position_mode:
+                (
+                    left_arm_builder
+                    .set_stiffness([TeleopSettings.impedance_stiffness] * len(self.robot_model.left_arm_idx))
+                    .set_damping_ratio(TeleopSettings.impedance_damping_ratio)
+                    .set_torque_limit([TeleopSettings.impedance_torque_limit] * len(self.robot_model.left_arm_idx))
+                )
             rc.set_left_arm_command(left_arm_builder)
         else:
             self.left_minimum_time = 0.8
         
-        # 로봇에 명령 전송
+        # 로봇에 명령 전송 (body만 - 마스터 암 버튼 눌렀을 때만)
         if self.command_stream:
-            self.command_stream.send_command(
-                rby.RobotCommandBuilder().set_command(
-                    rby.ComponentBasedCommandBuilder().set_body_command(rc)
-                )
-            )
+            try:
+                has_arm_command = state.button_right.button or state.button_left.button
+                
+                if has_arm_command:
+                    cmd_builder = rby.ComponentBasedCommandBuilder().set_body_command(rc)
+                    self.command_stream.send_command(
+                        rby.RobotCommandBuilder().set_command(cmd_builder)
+                    )
+            except RuntimeError as e:
+                # command_stream 만료시 재생성
+                if "expired" in str(e):
+                    try:
+                        self.command_stream = self.robot.create_command_stream(priority=1)
+                    except:
+                        pass
         
         return ma_input
 
@@ -846,6 +1220,29 @@ class RBY1Recorder:
                         obs[f"{name}.vel"] = float(velocities[idx])
                         obs[f"{name}.torque"] = float(torques[idx])
 
+            # [개발중] 휠 데이터 수집
+            if self.use_wheels and self.robot_model is not None:
+                try:
+                    # 휠 인덱스 가져오기 (RBY1-A: wheel_0=22, wheel_1=23)
+                    wheel_indices = getattr(self.robot_model, 'wheel_idx', None)
+                    if wheel_indices is None:
+                        # 기본 인덱스 사용 (head 다음)
+                        wheel_indices = [22, 23]
+                    
+                    for i, wheel_name in enumerate(WHEEL_JOINTS):
+                        if i < len(wheel_indices):
+                            idx = wheel_indices[i]
+                            if idx < len(positions):
+                                obs[f"{wheel_name}.pos"] = float(positions[idx])
+                                obs[f"{wheel_name}.vel"] = float(velocities[idx])
+                                obs[f"{wheel_name}.torque"] = float(torques[idx])
+                except Exception as e:
+                    # 휠 데이터 수집 실패시 0으로 채움
+                    for wheel_name in WHEEL_JOINTS:
+                        obs[f"{wheel_name}.pos"] = 0.0
+                        obs[f"{wheel_name}.vel"] = 0.0
+                        obs[f"{wheel_name}.torque"] = 0.0
+
             # 그리퍼 상태 (tool_state에서 가져오기)
             try:
                 if hasattr(state, 'tool_state') and state.tool_state is not None:
@@ -893,6 +1290,10 @@ class RBY1Recorder:
                         if color_frame:
                             frame_rgb = np.asanyarray(color_frame.get_data())
                             obs[cam_name] = frame_rgb
+                            # 웹 스트리밍용 버퍼에 저장
+                            if self.stream_port > 0:
+                                with self.stream_lock:
+                                    self.stream_frames[cam_name] = frame_rgb.copy()
                     except Exception:
                         pass  # 개별 카메라 실패시 무시
             except Exception as e:
@@ -905,6 +1306,10 @@ class RBY1Recorder:
                 # BGR -> RGB 변환
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 obs["camera"] = frame_rgb
+                # 웹 스트리밍용 버퍼에 저장
+                if self.stream_port > 0:
+                    with self.stream_lock:
+                        self.stream_frames["camera"] = frame_rgb.copy()
 
         return obs
 
@@ -1122,6 +1527,21 @@ class RBY1Recorder:
         else:
             cam_status = '비활성화'
         print(f"  카메라: {cam_status}")
+        
+        # [개발중] 휠 기록 상태
+        if self.use_wheels:
+            wheel_status = "✓ 활성화 [개발중]"
+        else:
+            wheel_status = "비활성화"
+        print(f"  휠 기록: {wheel_status}")
+        
+        # 초기 자세 리셋 상태
+        if self.use_teleop and self.reset_pose_each_episode:
+            reset_status = "✓ 활성화 (매 에피소드 시작시 초기 자세로 이동)"
+        else:
+            reset_status = "비활성화 (--no-reset 또는 teleop 비활성)"
+        print(f"  초기 자세 리셋: {reset_status}")
+        print(f"  제어 모드: {self.control_mode}")
         print("=" * 60)
         print("\n키보드 조작:")
         print("  [SPACE] 녹화 시작/일시정지")
@@ -1129,6 +1549,12 @@ class RBY1Recorder:
         print("  [R]     현재 에피소드 취소 & 다시 녹화")
         print("  [B]     이전 에피소드 삭제 & 재녹화")
         print("  [Q]     종료")
+        # 헤드 제어 기능 비활성화 (안전 문제로 제거됨)
+        # if self.use_teleop:
+        #     print("  ─────── 헤드 제어 ───────")
+        #     print("  [W/S]   헤드 위/아래 (tilt)")
+        #     print("  [A/D]   헤드 좌/우 (pan)")
+        #     print("  [X]     헤드 중앙 리셋")
         print("=" * 60)
 
         # Feature 정의
@@ -1173,6 +1599,10 @@ class RBY1Recorder:
                 
                 # 에피소드 시작시 이전 EEF pose 초기화
                 self.prev_eef_pose = {}
+                
+                # 에피소드 시작시 초기 자세로 이동 (teleop 모드 + reset 활성화시)
+                if self.use_teleop and self.reset_pose_each_episode:
+                    self.move_to_ready_pose(wait_time=3.0)
 
                 while not episode_done:
                     key = keyboard.get_key(timeout=0.05)
@@ -1247,6 +1677,19 @@ class RBY1Recorder:
                                 dataset.finalize()
                                 self._print_summary(output_name, episode_idx, total_frames, save_root)
                             return dataset
+                        
+                        # 헤드 제어 기능 비활성화 (안전 문제로 제거됨)
+                        # elif self.use_teleop and self.command_stream is not None:
+                        #     if key.lower() == 'w':  # W - 헤드 위로
+                        #         self.move_head('up')
+                        #     elif key.lower() == 's':  # S - 헤드 아래로
+                        #         self.move_head('down')
+                        #     elif key.lower() == 'a':  # A - 헤드 왼쪽
+                        #         self.move_head('left')
+                        #     elif key.lower() == 'd':  # D - 헤드 오른쪽
+                        #         self.move_head('right')
+                        #     elif key.lower() == 'x':  # X - 헤드 중앙으로
+                        #         self.move_head('center')
 
                     # 녹화 중일 때 프레임 수집
                     if recording:
@@ -1419,6 +1862,9 @@ def main():
 
   # 오른팔만 10개 에피소드
   python record_rby1_standalone.py --address 192.168.30.1:50051 --arms right --episodes 10
+  
+  # 카메라 웹 스트리밍과 함께 녹화 (http://localhost:8000)
+  python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --stream 8000 --episodes 5
         """
     )
 
@@ -1436,6 +1882,14 @@ def main():
                         help="RealSense 카메라 비활성화 (기본: RealSense 사용)")
     parser.add_argument("--cameras", type=str, default=None,
                         help="카메라 이름 (쉼표 구분, 예: cam_high,cam_left_wrist,cam_right_wrist)")
+    parser.add_argument("--stream", type=int, default=0,
+                        help="카메라 웹 스트리밍 포트 (예: 8000, 0이면 비활성화)")
+    parser.add_argument("--mode", type=str, default="impedance", choices=["position", "impedance"],
+                        help="제어 모드: position(정밀) 또는 impedance(유연, 기본값)")
+    parser.add_argument("--no-reset", action="store_true",
+                        help="에피소드마다 초기 자세 리셋 비활성화 (기본: 매 에피소드 리셋)")
+    parser.add_argument("--wheels", action="store_true",
+                        help="[개발중] 휠(wheel) 데이터 기록 활성화")
     parser.add_argument("--fps", type=int, default=30,
                         help="녹화 FPS (기본: 30)")
     parser.add_argument("--episodes", "-e", type=int, default=1,
@@ -1482,6 +1936,10 @@ def main():
         use_realsense=use_realsense,
         use_teleop=args.teleop,
         camera_names=camera_names,
+        stream_port=args.stream,
+        control_mode=args.mode,
+        reset_pose=not args.no_reset,
+        use_wheels=args.wheels,
     )
 
     try:

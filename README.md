@@ -42,11 +42,20 @@ python record_rby1_standalone.py --address 192.168.30.1:50051 -e 5
 # Control robot directly with master arm while recording
 python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop -e 5
 
-# Teleoperation with camera
+# Teleoperation with impedance control (default, compliant)
 python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop -e 5
+
+# Teleoperation with position control (precise)
+python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --mode position -e 5
 
 # Recording without camera
 python record_rby1_standalone.py --address 192.168.30.1:50051 --no-realsense -e 5
+
+# With camera web streaming (view at http://localhost:8000)
+python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --stream 8000 -e 5
+
+# Disable pose reset at each episode start
+python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --no-reset -e 5
 ```
 
 ### Arguments
@@ -57,13 +66,17 @@ python record_rby1_standalone.py --address 192.168.30.1:50051 --no-realsense -e 
 | `--model` | str | `a` | Robot model: `a`, `m`, `ub` |
 | `--arms` | str | `right` | Arms to record: `right`, `left`, `both` |
 | `--teleop` | flag | false | **Teleoperation mode** (acquire control, control robot with master arm) |
+| `--mode` | str | `impedance` | Control mode: `position` (precise) or `impedance` (compliant) |
+| `--no-reset` | flag | false | Disable pose reset at each episode start |
 | `--camera` | int | None | USB camera ID (e.g., 0, 1) |
 | `--no-realsense` | flag | false | Disable RealSense camera (default: RealSense enabled) |
 | `--cameras` | str | auto | Camera names (comma-separated, e.g., `cam_high,cam_left_wrist,cam_right_wrist`) |
+| `--stream` | int | `0` | Camera web streaming port (e.g., `8000`, 0 to disable) |
 | `--fps` | int | `30` | Recording FPS |
 | `--episodes`, `-e` | int | `1` | Number of episodes to record |
 | `--output` | str | auto | Output dataset name (default: `rby1_YYYYMMDD_HHMMSS`) |
 | `--task` | str | prompt | Task description (natural language instruction) |
+| `--wheels` | flag | false | **[DEV]** Enable wheel data recording |
 
 ### Keyboard Controls
 
@@ -203,13 +216,29 @@ python lerobot/scripts/train.py \
    - Only works on UPC (Ubuntu PC)
    - Requires master arm connection
 
-3. **Robot power** must be on before recording
+3. **Control Mode**:
+   - `impedance` (default): Compliant control, safe for human interaction
+   - `position`: Precise position control, stiffer response
+
+4. **Pose Reset**: Robot returns to ready pose at each episode start (disable with `--no-reset`)
+
+5. **Robot power** must be on before recording
    - Observation-only mode: SDK teleoperation already turns it on
    - Teleoperation mode: Script automatically powers on
 
-4. **Maximum episode duration** is 5 minutes
+6. **Maximum episode duration** is 5 minutes
 
-5. **RealSense camera** is enabled by default (disable with `--no-realsense`)
+7. **RealSense camera** is enabled by default (disable with `--no-realsense`)
+
+8. **Camera streaming**: Use `--stream 8000` to view cameras at `http://localhost:8000`
+
+---
+
+## 🚧 Development Features
+
+| Feature | Flag | Description |
+|---------|------|-------------|
+| Wheel recording | `--wheels` | Record wheel encoder data (wheel_0, wheel_1) |
 
 ---
 
