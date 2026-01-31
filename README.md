@@ -5,9 +5,10 @@ Data collection and replay tool for LeRobot format datasets on RBY1 robot.
 ## 📁 File Structure
 
 ```
-vla_ws/
-├── record_rby1_standalone.py   # Data recording script
+rby1-lerobot_dataset/
+├── record_rby1_standalone.py   # Data recording script (main)
 ├── replay_rby1_standalone.py   # Data inspection/replay script
+├── merge_datasets.py           # Dataset merging utility
 ├── datasets/                   # Saved datasets
 │   └── rby1_YYYYMMDD_HHMMSS/
 │       ├── data/               # Parquet data
@@ -234,7 +235,21 @@ python lerobot/scripts/train.py \
 
 ---
 
-## 🚧 Development Features
+## � Merging Datasets (merge_datasets.py)
+
+Merge multiple datasets with the same task description into a single dataset.
+
+```bash
+# Merge all datasets containing "pick" in task description
+python merge_datasets.py --task pick --output merged_pick_dataset
+
+# Merge specific datasets by name
+python merge_datasets.py --datasets rby1_20260107_123456 rby1_20260108_234567 --output merged_dataset
+```
+
+---
+
+## �🚧 Development Features
 
 | Feature | Flag | Description |
 |---------|------|-------------|

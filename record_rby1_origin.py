@@ -65,9 +65,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# WebUI 템플릿 import
-from webui_template import generate_html, generate_camera_div
-
 try:
     import rby1_sdk as rby
     import rby1_sdk.dynamics as rby_dyn
@@ -104,102 +101,54 @@ WHEEL_JOINTS = [
     "wheel_1",  # 오른쪽 휠
 ]
 
-# ============================================================================
-# RealSense 카메라 시리얼 번호 ↔ 이름 매핑
-# 시리얼 번호는 재부팅해도 변하지 않으므로 안정적인 매핑 가능
-# ============================================================================
-CAMERA_SERIAL_MAP = {
-    "315122272205": "cam_left_wrist",   # D405 - 왼손
-    "335122271196": "cam_right_wrist",  # D405 - 오른손
-    # D435i 헤드 카메라는 시리얼 번호 확인 후 추가
-    # "XXXXXXXXXX": "cam_high",  # D435i - 헤드
-}
-
-# 카메라 모델명으로 자동 감지 (시리얼 매핑이 없을 때 fallback)
-CAMERA_MODEL_MAP = {
-    "D435i": "cam_high",      # D435i는 헤드 카메라로 자동 할당
-    "D435": "cam_high",       # D435도 헤드로
-}
-
 
 # ============================================================================
 # 텔레오퍼레이션 설정 (SDK에서 가져옴)
-# 참조: rby1-sdk/examples/python/17_teleoperation_with_joint_mapping.py
 # ============================================================================
 
 class TeleopSettings:
-    """텔레오퍼레이션 설정
-    
-    17_teleop 기본값과 동일:
-        master_arm_loop_period = 1 / 100
-        impedance_stiffness = 50
-        impedance_damping_ratio = 1.0
-        impedance_torque_limit = 30.0
-    """
-    master_arm_loop_period = 1 / 100  # 100Hz (17_teleop 기본값: 1/100)
-    impedance_stiffness = 50          # (17_teleop 기본값: 50)
-    impedance_damping_ratio = 1.0     # (17_teleop 기본값: 1.0)
-    impedance_torque_limit = 30.0     # (17_teleop 기본값: 30.0)
-    
-    # ========================================================================
-    # 안전 모니터링 임계값 (비활성화됨)
-    # ========================================================================
-    # 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-    # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-    # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
-    
-    # 하위 호환성용 (WebUI에서 사용할 수 있음)
-    temp_warning = 60
-    temp_critical = 70
-    current_warning = 10.0
-    current_critical = 20.0
-    torque_warning = 30.0
-    torque_critical = 50.0
+    """텔레오퍼레이션 설정"""
+    master_arm_loop_period = 1 / 100  # 100Hz
+    impedance_stiffness = 50
+    impedance_damping_ratio = 1.0
+    impedance_torque_limit = 30.0
 
-# ============================================================================
-# 초기 자세 설정
-# ============================================================================
-# 17_teleop 기본값 (Ready pose):
-#   torso:     [0.0, 45.0, -90.0, 45.0, 0.0, 0.0] deg
-#   right_arm: [0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0] deg
-#   left_arm:  [0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0] deg
-#
-# 아래는 커스텀 자세 예시들:
-#   Packing:   torso [0.0, 80.0, -140.0, 60.0, 0.0, 0.0] deg  ← 현재 "A" 모델에 적용됨
-#   중간허리:  torso [0.0, 55.0, -110.0, 50.0, 0.0, 0.0] deg
-#   전투모드:  torso [0.0, 67.8, -82.8, 31.8, 0.0, 0.0] deg (라디안으로 저장된 값 변환)
-# ============================================================================
+#Ready:"torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
+#Packing:"torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
+
+#right_arm=np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+#left_arm=np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+
+#중간허리 np.deg2rad([0.0, 55.0, -110.0, 50.0, 0.0, 0.0]
+
+#전투모드
+#torso = np.array([0.0,1.1839635825151906,-1.4456515921713253,0.5552402935002304,0.0,0.0,])
+#right_arm = np.array([-0.015897964254646485,-1.6672738461993182,-0.3115309943159733,-1.1695426443162062,0.7229574754265632,-1.3463979472390455,0.0,])
+#left_arm = np.array([0.00019364608955982105,1.679986142431598,0.3165619956623804,-1.1723713960166389,-0.7150267947531944,-1.271152354641285,0.0,])
 
 # 초기 자세 (모델별)
 READY_POSE = {
     "A": {
-        # ⚠️ 변경됨: 17_teleop 기본값 [0,45,-90,45,0,0] → Packing 자세 [0,80,-140,60,0,0]
         "torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
-        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),  # 17_teleop 기본값과 동일
-        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),   # 17_teleop 기본값과 동일
-        # 전투모드 (주석):
+        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0] ),
         #"torso": np.array([0.0,1.1839635825151906,-1.4456515921713253,0.5552402935002304,0.0,0.0,]),
         #"right_arm": np.array([-0.015897964254646485,-1.6672738461993182,-0.3115309943159733,-1.1695426443162062,0.7229574754265632,-1.3463979472390455,0.0,]),
         #"left_arm": np.array([0.00019364608955982105,1.679986142431598,0.3165619956623804,-1.1723713960166389,-0.7150267947531944,-1.271152354641285,0.0,]),
     },
     "M": {
-        "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),           # 17_teleop 기본값과 동일
-        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]), # 17_teleop 기본값과 동일
-        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),   # 17_teleop 기본값과 동일
+        "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
+        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
     },
 }
 
-# ============================================================================
-# 마스터 암 관절 제한 (17_teleop 기본값과 동일)
-# ============================================================================
-MA_Q_LIMIT_BARRIER = 0.5  # (17_teleop 기본값: 0.5)
-# 마스터 암 관절 각도 제한 [오른팔 7 + 왼팔 7]
-MA_MIN_Q = np.deg2rad([-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360])  # 17_teleop 기본값
-MA_MAX_Q = np.deg2rad([360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360])           # 17_teleop 기본값
-# 마스터 암 토크 제한 (XM540: 3.5Nm, XM430: 1.5Nm)
-MA_TORQUE_LIMIT = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)  # 17_teleop 기본값
-# 마스터 암 점성 게인 (관절별 damping)
-MA_VISCOUS_GAIN = np.array([0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2)  # 17_teleop 기본값
+# 마스터 암 관절 제한
+MA_Q_LIMIT_BARRIER = 0.5
+MA_MIN_Q = np.deg2rad([-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360])
+MA_MAX_Q = np.deg2rad([360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360])
+MA_TORQUE_LIMIT = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)
+MA_VISCOUS_GAIN = np.array([0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2)
 
 # 그리퍼 방향 설정 (17_teleop 기본값: False = 반전)
 # True: 정방향 (trigger 증가 → 그리퍼 닫힘)
@@ -342,7 +291,7 @@ class KeyboardController:
         if self.old_settings:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
 
-    def get_key(self, timeout: float = 0.01) -> Optional[str]:
+    def get_key(self, timeout: float = 0.01) -> str | None:
         """비차단으로 키 입력 확인"""
         if select.select([sys.stdin], [], [], timeout)[0]:
             return sys.stdin.read(1)
@@ -420,26 +369,11 @@ class RBY1Recorder:
         self.state_lock = threading.Lock()
         self.running = False
         
-        # 시그널 핸들러 관련
-        self._shutdown_requested = False
-        self._original_sigint_handler = None
-        self._original_sigterm_handler = None
-        
-        # 셧다운 중복 호출 방지 플래그
-        self._master_arm_stopped = False
-        self._robot_control_cancelled = False
-        self._state_update_stopped = False
-        
-        # 안전 모니터링: 비활성화됨 (17_teleop과 동일)
-        # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-        # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
-        self._teleop_paused = False  # 하위 호환성용 (현재 미사용)
-        self._critical_reason = ""   # 하위 호환성용 (현재 미사용)
-        
-        # 로그 폴더/파일 설정 (시간 기반 폴더명)
-        self._log_dir = None
-        self._log_file = None
-        self._ma_log_count = 0
+        # EEF pose 관련
+        self.dyn_robot = None
+        self.dyn_state = None
+        self.robot_model = None
+        self.prev_eef_pose = {}  # 이전 EEF pose 저장 (delta 계산용)
 
         # 선택한 팔에 따른 조인트 이름 설정
         self.joint_names = self._get_joint_names(arms)
@@ -503,77 +437,6 @@ class RBY1Recorder:
             # 텔레오퍼레이션용 로봇 관절 위치 업데이트
             if robot_state is not None:
                 self.robot_q = np.array(robot_state.position)
-
-    def _setup_log_folder(self):
-        """로그 폴더 및 파일 설정 (시간 기반 폴더명)"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_base = Path.home() / "vla_ws" / "logs"
-        self._log_dir = log_base / f"teleop_{timestamp}"
-        self._log_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 텔레옵 로그 파일
-        log_path = self._log_dir / "teleop_state.log"
-        self._log_file = open(log_path, "w")
-        self._log_file.write(f"# Teleop State Log - {timestamp}\n")
-        self._log_file.write("# Format: timestamp,button_right,button_left,trigger_right,trigger_left\n")
-        self._log_file.flush()
-        
-        # 안전 이벤트 로그 파일 (경고/위험 기록)
-        safety_log_path = self._log_dir / "safety_events.log"
-        self._safety_log_file = open(safety_log_path, "w")
-        self._safety_log_file.write(f"# Safety Events Log - {timestamp}\n")
-        self._safety_log_file.write("# Format: timestamp,level,message\n")
-        self._safety_log_file.flush()
-        
-        print(f"📁 로그 폴더: {self._log_dir}")
-    
-    def _write_teleop_log(self, state):
-        """텔레옵 상태를 로그 파일에 기록"""
-        if self._log_file is None:
-            return
-        
-        try:
-            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            line = f"{timestamp},{state.button_right.button},{state.button_left.button},{state.button_right.trigger},{state.button_left.trigger}\n"
-            self._log_file.write(line)
-            self._log_file.flush()
-        except Exception:
-            pass  # 로깅 실패는 무시
-    
-    def _write_safety_log(self, level: str, message: str):
-        """안전 이벤트를 로그 파일에 기록
-        
-        Args:
-            level: 'WARNING' 또는 'CRITICAL'
-            message: 이벤트 메시지
-        """
-        if not hasattr(self, '_safety_log_file') or self._safety_log_file is None:
-            return
-        
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            line = f"{timestamp},{level},{message}\n"
-            self._safety_log_file.write(line)
-            self._safety_log_file.flush()
-        except Exception:
-            pass  # 로깅 실패는 무시
-    
-    def _close_log_file(self):
-        """로그 파일 닫기"""
-        if self._log_file is not None:
-            try:
-                self._log_file.close()
-                self._log_file = None
-            except Exception:
-                pass
-        
-        # 안전 이벤트 로그 파일도 닫기
-        if hasattr(self, '_safety_log_file') and self._safety_log_file is not None:
-            try:
-                self._safety_log_file.close()
-                self._safety_log_file = None
-            except Exception:
-                pass
 
     def connect(self):
         """로봇 및 카메라, 마스터 암 연결"""
@@ -669,166 +532,13 @@ class RBY1Recorder:
 
         # 마스터 암 및 그리퍼 연결 (teleop 모드)
         if self.use_teleop:
-            self._setup_log_folder()  # 로그 폴더 설정
             self._setup_teleop()
-        
-        # 시그널 핸들러 등록 (안전한 종료를 위해)
-        self._register_signal_handlers()
-        print("✓ 시그널 핸들러 등록 완료 (Ctrl+C로 안전 종료)")
-
-    def _register_signal_handlers(self):
-        """시그널 핸들러 등록 (SIGINT, SIGTERM)"""
-        self._original_sigint_handler = signal.getsignal(signal.SIGINT)
-        self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def _restore_signal_handlers(self):
-        """원래 시그널 핸들러 복원"""
-        if self._original_sigint_handler is not None:
-            signal.signal(signal.SIGINT, self._original_sigint_handler)
-        if self._original_sigterm_handler is not None:
-            signal.signal(signal.SIGTERM, self._original_sigterm_handler)
-    
-    def _signal_handler(self, signum, frame):
-        """긴급 정지 시그널 핸들러 (Ctrl+C, SIGTERM)"""
-        if self._shutdown_requested:
-            # 두 번째 시그널: 강제 종료
-            print("\n⛔ 강제 종료!")
-            sys.exit(1)
-        
-        self._shutdown_requested = True
-        print("\n")
-        print("=" * 60)
-        print("⚠️  긴급 정지 요청 (Ctrl+C)")
-        print("=" * 60)
-        print("안전하게 종료 중...")
-        
-        # 녹화 중지
-        self.running = False
-        
-        # 1. 상태 업데이트 중지 (17_teleop과 동일: 가장 먼저)
-        if self.robot is not None and not self._state_update_stopped:
-            try:
-                self.robot.stop_state_update()
-                self._state_update_stopped = True
-                print("  ✓ 상태 업데이트 중지")
-            except Exception as e:
-                print(f"  ⚠ 상태 업데이트 중지 실패: {e}")
-        
-        # 2. 마스터 암 중지
-        if self.master_arm is not None and not self._master_arm_stopped:
-            try:
-                self.master_arm.stop_control()
-                self._master_arm_stopped = True
-                print("  ✓ 마스터 암 중지")
-            except Exception as e:
-                print(f"  ⚠ 마스터 암 중지 실패: {e}")
-        
-        # 3. 로봇 제어 취소
-        if self.robot is not None and not self._robot_control_cancelled:
-            try:
-                self.robot.cancel_control()
-                self._robot_control_cancelled = True
-                print("  ✓ 로봇 제어 취소")
-            except Exception as e:
-                print(f"  ⚠ 로봇 제어 취소 실패: {e}")
-        
-        # 잠시 대기 후 정리
-        time.sleep(0.5)
-        
-        # 전체 정리
-        try:
-            self.disconnect()
-        except Exception as e:
-            print(f"  ⚠ disconnect 중 오류: {e}")
-        
-        print("=" * 60)
-        print("종료 완료")
-        print("=" * 60)
-        sys.exit(0)
-
-    def _get_motor_status(self):
-        """로봇 및 마스터 암 모터 상태 수집"""
-        import json
-        
-        status = {
-            "robot": {
-                "connected": self.robot is not None and self.robot.is_connected(),
-                "joints": [],
-                "temperature": [],
-                "current": [],
-                "torque": [],
-            },
-            "master_arm": {
-                "connected": self.master_arm is not None,
-                "joints": [],
-                "q_joint": [],
-                "button_right": False,
-                "button_left": False,
-                "trigger_right": 0,
-                "trigger_left": 0,
-            },
-            "gripper": {
-                "connected": self.gripper is not None and self.gripper.bus is not None,
-                "target_q": [],
-                "min_q": [],
-                "max_q": [],
-            },
-            "limits": {
-                "temp_warning": TeleopSettings.temp_warning,
-                "temp_critical": TeleopSettings.temp_critical,
-                "current_warning": TeleopSettings.current_warning,
-                "current_critical": TeleopSettings.current_critical,
-                "torque_warning": TeleopSettings.torque_warning,
-                "torque_critical": TeleopSettings.torque_critical,
-            }
-        }
-        
-        # 로봇 상태
-        with self.state_lock:
-            if self.latest_state is not None:
-                state = self.latest_state
-                # joint_states에서 온도, 전류, 토크 읽기
-                if hasattr(state, 'temperature') and state.temperature:
-                    status["robot"]["temperature"] = list(state.temperature)
-                if hasattr(state, 'current') and state.current:
-                    status["robot"]["current"] = list(state.current)
-                if hasattr(state, 'torque') and state.torque:
-                    status["robot"]["torque"] = list(state.torque)
-                if hasattr(state, 'position') and state.position:
-                    status["robot"]["joints"] = list(state.position)
-        
-        # 마스터 암 상태
-        with self.master_arm_lock:
-            if self.master_arm_state is not None:
-                ma_state = self.master_arm_state
-                if hasattr(ma_state, 'q_joint'):
-                    status["master_arm"]["q_joint"] = list(ma_state.q_joint)
-                if hasattr(ma_state, 'button_right'):
-                    status["master_arm"]["button_right"] = bool(ma_state.button_right.button)
-                    status["master_arm"]["trigger_right"] = int(ma_state.button_right.trigger)
-                if hasattr(ma_state, 'button_left'):
-                    status["master_arm"]["button_left"] = bool(ma_state.button_left.button)
-                    status["master_arm"]["trigger_left"] = int(ma_state.button_left.trigger)
-        
-        # 그리퍼 상태
-        if self.gripper is not None:
-            if self.gripper.target_q is not None:
-                status["gripper"]["target_q"] = list(self.gripper.target_q)
-            if np.isfinite(self.gripper.min_q).all():
-                status["gripper"]["min_q"] = list(self.gripper.min_q)
-            if np.isfinite(self.gripper.max_q).all():
-                status["gripper"]["max_q"] = list(self.gripper.max_q)
-        
-        return status
 
     def _start_stream_server(self):
-        """웹 스트리밍 서버 시작 (MJPEG 멀티스레드 + 모터 모니터링)"""
+        """웹 스트리밍 서버 시작 (MJPEG 멀티스레드)"""
         recorder = self
         from socketserver import ThreadingMixIn
         import cv2
-        import json
         
         class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
             daemon_threads = True
@@ -840,35 +550,66 @@ class RBY1Recorder:
                     self.send_header('Content-type', 'text/html')
                     self.end_headers()
                     
-                    # 연결된 카메라 목록으로 HTML 생성
+                    # 연결된 카메라 목록으로 HTML 생성 (rs_pipelines에서 가져옴)
+                    camera_divs = ""
                     cam_names = list(recorder.rs_pipelines.keys()) if recorder.rs_pipelines else []
+                    
+                    # rs_pipelines가 없으면 stream_frames에서 가져옴
                     if not cam_names:
                         with recorder.stream_lock:
                             cam_names = list(recorder.stream_frames.keys())
                     
-                    camera_divs = "".join(generate_camera_div(name) for name in cam_names)
+                    for cam_name in cam_names:
+                        camera_divs += f'''
+                        <div class="camera">
+                            <h3>{cam_name}</h3>
+                            <img src="/{cam_name}.mjpeg" width="640">
+                        </div>
+                        '''
                     
-                    # 임계값 설정
-                    limits = {
-                        "temp_warning": TeleopSettings.temp_warning,
-                        "temp_critical": TeleopSettings.temp_critical,
-                        "current_warning": TeleopSettings.current_warning,
-                        "current_critical": TeleopSettings.current_critical,
-                        "torque_warning": TeleopSettings.torque_warning,
-                        "torque_critical": TeleopSettings.torque_critical,
-                    }
+                    if not camera_divs:
+                        camera_divs = '<p style="color: #ff9800;">카메라가 연결되지 않았습니다.</p>'
                     
-                    html = generate_html(camera_divs, recorder.stream_port, limits)
+                    html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RBY1 Camera Stream</title>
+    <style>
+        body {{ 
+            font-family: Arial, sans-serif; 
+            background: #1e1e1e; 
+            color: white;
+            margin: 20px;
+        }}
+        h1 {{ color: #4fc3f7; }}
+        .status {{ 
+            background: #2d2d2d; 
+            padding: 10px 20px; 
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: inline-block;
+        }}
+        .container {{ display: flex; flex-wrap: wrap; gap: 20px; }}
+        .camera {{ 
+            background: #2d2d2d; 
+            padding: 10px; 
+            border-radius: 8px;
+        }}
+        .camera h3 {{ margin: 0 0 10px 0; color: #81c784; }}
+        img {{ max-width: 100%; border-radius: 4px; }}
+    </style>
+</head>
+<body>
+    <h1>🎥 RBY1 Camera Stream</h1>
+    <div class="status">📡 MJPEG Streaming at {recorder.stream_port}</div>
+    <div class="container">
+        {camera_divs}
+    </div>
+</body>
+</html>
+                    '''
                     self.wfile.write(html.encode())
-                
-                elif self.path == '/api/status':
-                    # JSON API 엔드포인트
-                    self.send_response(200)
-                    self.send_header('Content-type', 'application/json')
-                    self.send_header('Access-Control-Allow-Origin', '*')
-                    self.end_headers()
-                    status = recorder._get_motor_status()
-                    self.wfile.write(json.dumps(status).encode())
                     
                 elif self.path.endswith('.mjpeg'):
                     # MJPEG 스트리밍
@@ -942,7 +683,7 @@ class RBY1Recorder:
         print(f"🌐 카메라 스트리밍: http://localhost:{self.stream_port}")
 
     def _connect_camera(self):
-        """카메라 연결 (멀티 RealSense - 시리얼 번호 기반 동적 매핑)"""
+        """카메라 연결 (멀티 RealSense 또는 일반 USB 카메라)"""
         # RealSense 카메라 시도 (멀티 카메라 지원)
         if self.use_realsense:
             try:
@@ -957,31 +698,16 @@ class RBY1Recorder:
                 else:
                     print(f"🔍 {len(devices)}개의 RealSense 카메라 감지됨")
                     
-                    unassigned_idx = 0  # 매핑 안 된 카메라용 인덱스
-                    
                     # 각 카메라에 파이프라인 생성
-                    for device in devices:
+                    for i, device in enumerate(devices):
                         serial = device.get_info(rs.camera_info.serial_number)
-                        model_name = device.get_info(rs.camera_info.name)
+                        name = device.get_info(rs.camera_info.name)
                         
-                        # 1. 시리얼 번호로 카메라 이름 결정 (최우선)
-                        if serial in CAMERA_SERIAL_MAP:
-                            cam_name = CAMERA_SERIAL_MAP[serial]
-                        # 2. 모델명으로 자동 감지 (D435i → cam_high)
-                        elif any(model in model_name for model in CAMERA_MODEL_MAP):
-                            for model, default_name in CAMERA_MODEL_MAP.items():
-                                if model in model_name:
-                                    # 이미 할당된 이름인지 확인
-                                    if default_name not in self.rs_pipelines:
-                                        cam_name = default_name
-                                    else:
-                                        cam_name = f"{default_name}_{unassigned_idx}"
-                                        unassigned_idx += 1
-                                    break
-                        # 3. 기본 이름 할당
+                        # 카메라 이름 할당
+                        if i < len(self.camera_names):
+                            cam_name = self.camera_names[i]
                         else:
-                            cam_name = f"camera_{unassigned_idx}"
-                            unassigned_idx += 1
+                            cam_name = f"camera_{i}"
                         
                         try:
                             pipeline = rs.pipeline()
@@ -991,7 +717,7 @@ class RBY1Recorder:
                             
                             pipeline.start(config)
                             self.rs_pipelines[cam_name] = (pipeline, serial)
-                            print(f"  ✓ {cam_name}: {model_name} (S/N: {serial})")
+                            print(f"  ✓ {cam_name}: {name} (S/N: {serial})")
                         except Exception as e:
                             print(f"  ⚠ {cam_name} 초기화 실패: {e}")
                     
@@ -1000,11 +726,6 @@ class RBY1Recorder:
                         first_name = list(self.rs_pipelines.keys())[0]
                         self.rs_pipeline = self.rs_pipelines[first_name][0]
                         print(f"✓ 총 {len(self.rs_pipelines)}개 RealSense 카메라 연결됨")
-                        
-                        # 매핑 요약 출력
-                        print("📷 카메라 매핑:")
-                        for cname, (_, cserial) in self.rs_pipelines.items():
-                            print(f"   {cname} ← S/N: {cserial}")
                     
                     if self.rs_pipelines:
                         return
@@ -1051,67 +772,28 @@ class RBY1Recorder:
             else:
                 print("✓ Position 모드 활성화")
             
-            # ========================================================================
-            # ⚠️ 안전: 초기 자세로 이동 (17_teleop의 move_j처럼 블로킹)
-            # 로봇이 이동 중에 마스터 암 제어가 시작되면 충돌 위험!
-            # ========================================================================
+            # 초기 자세로 이동 (command_stream 사용)
             print("초기 자세로 이동 중...")
             ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
-            self._send_ready_pose_stream(ready_pose, minimum_time=5.0)
+            self._send_ready_pose_stream(ready_pose)
+            print("✓ 초기 자세 명령 전송 완료")
             
-            # 초기 자세 도달까지 폴링 대기
-            pose_reached = self._wait_for_pose_reached(ready_pose, tolerance=0.05, timeout=10.0)
-            if not pose_reached:
-                # 사용자에게 경고하고 확인 요청
-                print("\n" + "=" * 60)
-                print("⚠️  경고: 초기 자세 도달 타임아웃!")
-                print("   로봇이 예상 위치에 도달하지 못했습니다.")
-                print("   현재 위치에서 시작하면 마스터 암과 동기화되지 않을 수 있습니다.")
-                print("=" * 60)
-                # 3초 대기 (사용자가 상황 인지하도록)
-                for i in range(3, 0, -1):
-                    print(f"   {i}초 후 현재 위치에서 시작...", end="\r")
-                    time.sleep(1)
-                print("   현재 위치에서 시작합니다.          ")
-            print("✓ 초기 자세 이동 완료")
-            
-            # 그리퍼 초기화 (17_teleop: 초기화 실패 시 종료)
+            # 그리퍼 초기화
             self.gripper = Gripper()
-            if not self.gripper.initialize():
-                # 17_teleop과 동일: 그리퍼 초기화 실패 시 정리 후 예외 발생
-                logging.error("그리퍼 초기화 실패 - 안전을 위해 텔레오퍼레이션 중단")
+            if self.gripper.initialize():
+                self.gripper.homing()
+                self.gripper.start()
+            else:
+                print("⚠ 그리퍼 없이 진행")
                 self.gripper = None
-                # 이미 시작된 리소스 정리
-                if self.command_stream:
-                    try:
-                        self.robot.cancel_control()
-                        self.robot.disable_control_manager()
-                        self.robot.power_off("12v")
-                    except:
-                        pass
-                raise RuntimeError("그리퍼 초기화 실패 - 텔레오퍼레이션 불가")
-            
-            self.gripper.homing()
-            self.gripper.start()
             
             # 마스터 암 초기화
             rby.upc.initialize_device(rby.upc.MasterArmDeviceName)
             
-            # 마스터 암 URDF 경로 (17_teleop과 동일한 방식: 스크립트 상대경로 우선)
-            # 1. 워크스페이스 내 rby1-sdk 경로
-            sdk_path = Path(__file__).parent.parent / "rby1-sdk"
+            sdk_path = Path(__file__).parent / "rby1-sdk"
             if not sdk_path.exists():
-                # 2. 스크립트와 같은 레벨의 rby1-sdk
-                sdk_path = Path(__file__).parent / "rby1-sdk"
-            if not sdk_path.exists():
-                # 3. 홈 디렉토리 기본 경로
                 sdk_path = Path.home() / "vla_ws" / "rby1-sdk"
-            if not sdk_path.exists():
-                sdk_path = Path.home() / "molmo_ws" / "rby1-sdk"
-            
             master_arm_model = str(sdk_path / "models" / "master_arm" / "model.urdf")
-            if not Path(master_arm_model).exists():
-                raise FileNotFoundError(f"마스터 암 URDF 파일 없음: {master_arm_model}")
             
             self.master_arm = rby.upc.MasterArm(rby.upc.MasterArmDeviceName)
             self.master_arm.set_model_path(master_arm_model)
@@ -1135,41 +817,10 @@ class RBY1Recorder:
         except AttributeError as e:
             print(f"⚠ 텔레오퍼레이션 설정 실패: UPC 기능 없음 ({e})")
             print("  → 이 기능은 UPC(Ubuntu PC)에서만 사용 가능합니다.")
-            self._cleanup_teleop_on_error()
-            raise RuntimeError(f"UPC 기능 없음: {e}")
+            self.master_arm = None
         except Exception as e:
             print(f"⚠ 텔레오퍼레이션 설정 실패: {e}")
-            self._cleanup_teleop_on_error()
-            raise
-    
-    def _cleanup_teleop_on_error(self):
-        """텔레오퍼레이션 설정 실패 시 안전 정리"""
-        # 그리퍼 정리
-        if self.gripper is not None:
-            try:
-                self.gripper.stop()
-            except:
-                pass
-            self.gripper = None
-        
-        # 마스터 암 정리
-        if self.master_arm is not None:
-            try:
-                self.master_arm.stop_control()
-            except:
-                pass
             self.master_arm = None
-        
-        # 로봇 제어 정리
-        if self.command_stream is not None:
-            try:
-                self.robot.cancel_control()
-                time.sleep(0.5)
-                self.robot.disable_control_manager()
-                self.robot.power_off("12v")
-            except:
-                pass
-            self.command_stream = None
     
     def _send_ready_pose_stream(self, pose: dict, minimum_time: float = 5.0):
         """초기 자세로 이동 (command_stream 사용, 비블로킹)"""
@@ -1235,52 +886,11 @@ class RBY1Recorder:
         
         self.command_stream.send_command(cmd)
     
-    def _wait_for_pose_reached(self, target_pose: dict, tolerance: float = 0.05, timeout: float = 10.0) -> bool:
-        """목표 자세에 도달할 때까지 폴링 대기
-        
-        Args:
-            target_pose: 목표 자세 dict (right_arm, left_arm 키)
-            tolerance: 허용 오차 (라디안)
-            timeout: 최대 대기 시간 (초)
-            
-        Returns:
-            True if reached, False if timeout
-        """
-        start = time.time()
-        right_target = np.array(target_pose["right_arm"])
-        left_target = np.array(target_pose["left_arm"])
-        
-        while time.time() - start < timeout:
-            with self.state_lock:
-                if self.latest_state is None:
-                    time.sleep(0.1)
-                    continue
-                current = np.array(self.latest_state.position)
-            
-            # 현재 관절 위치와 목표 비교
-            right_current = current[self.robot_model.right_arm_idx]
-            left_current = current[self.robot_model.left_arm_idx]
-            
-            right_error = np.max(np.abs(right_target - right_current))
-            left_error = np.max(np.abs(left_target - left_current))
-            
-            elapsed = time.time() - start
-            print(f"\r   대기 중... R_err:{right_error:.3f} L_err:{left_error:.3f} ({elapsed:.1f}s)", end="", flush=True)
-            
-            if right_error < tolerance and left_error < tolerance:
-                print()  # 줄바꿈
-                return True
-            
-            time.sleep(0.1)
-        
-        print()  # 줄바꿈
-        return False
-    
-    def move_to_ready_pose(self, timeout: float = 5.0):
+    def move_to_ready_pose(self, wait_time: float = 3.0):
         """초기 자세로 이동 (에피소드 시작시 호출)
         
         Args:
-            timeout: 최대 대기 시간 (초)
+            wait_time: 이동 완료 대기 시간 (초)
         """
         if not self.use_teleop or self.command_stream is None:
             return
@@ -1291,9 +901,8 @@ class RBY1Recorder:
         print("\n🔄 초기 자세로 이동 중...")
         self._send_ready_pose_stream(ready_pose, minimum_time=2.0)
         
-        # 스마트 대기: 목표 도달시 즉시 진행
-        if not self._wait_for_pose_reached(ready_pose, tolerance=0.05, timeout=timeout):
-            print("   ⚠ 타임아웃 - 현재 위치에서 진행")
+        # 이동 완료 대기
+        time.sleep(wait_time)
         
         # 마스터 암 목표 위치도 초기화
         if self.master_arm is not None:
@@ -1375,49 +984,11 @@ class RBY1Recorder:
             print(f"⚠ 초기 자세 이동 오류: {e}")
             return False
     
-    # _check_safety_limits 제거됨 - 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-    # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-    # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
-    
     def _master_arm_control_loop(self, state):
-        """마스터 암 제어 콜백 - 로봇을 실시간으로 제어
-
-        
-        Note: 이 콜백은 100Hz로 호출되므로 예외 발생 시 안전하게 처리해야 함
-        """
-        try:
-            return self._master_arm_control_loop_inner(state)
-        except Exception as e:
-            # 콜백 내부 예외 발생 시 안전하게 처리
-            logging.error(f"마스터 암 콜백 오류: {e}")
-            # 기본 입력 반환 (로봇 정지 상태 유지)
-            return rby.upc.MasterArm.ControlInput()
-    
-    def _master_arm_control_loop_inner(self, state):
-        """마스터 암 제어 콜백 내부 구현
-        
-        Args:
-            state: 마스터 암 상태 (rby.upc.MasterArm.State)
-                   - q_joint: 마스터 암 관절 위치
-                   - qvel_joint: 마스터 암 관절 속도
-                   - button_right/left: 버튼 상태
-                   - gravity_term: 중력 보상 토크
-        """
-        # 현재 마스터 암 상태 저장 (녹화용)
+        """마스터 암 제어 콜백 - 로봇을 실시간으로 제어"""
+        # 현재 상태 저장 (녹화용)
         with self.master_arm_lock:
             self.master_arm_state = state
-        
-        # ========================================================================
-        # 안전 모니터링: 비활성화됨
-        # 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-        # 마스터 암 상태(state)에는 temperature/current/torque 필드 없음
-        # ========================================================================
-        
-        # 로그 파일에 저장 (17_teleop과 동일: 매초 버튼/트리거 상태)
-        self._ma_log_count += 1
-        if self._ma_log_count % round(1 / TeleopSettings.master_arm_loop_period) == 0:
-            self._write_teleop_log(state)
-            self._ma_log_count = 0
         
         # 로봇 관절 위치가 없으면 대기
         if self.robot_q is None:
@@ -1452,20 +1023,20 @@ class RBY1Recorder:
         )
         torque = np.clip(torque, -MA_TORQUE_LIMIT, MA_TORQUE_LIMIT)
         
-        # 오른팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
+        # 오른팔 마스터 암 제어
         if state.button_right.button == 1:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[0:7] = torque[0:7] * 0.6  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[0:7] = torque[0:7] * 0.6
             self.right_q = np.array(state.q_joint[0:7])
         else:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
             ma_input.target_torque[0:7] = MA_TORQUE_LIMIT[0:7]
             ma_input.target_position[0:7] = self.right_q
         
-        # 왼팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
+        # 왼팔 마스터 암 제어
         if state.button_left.button == 1:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[7:14] = torque[7:14] * 0.6  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[7:14] = torque[7:14] * 0.6
             self.left_q = np.array(state.q_joint[7:14])
         else:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -1608,69 +1179,8 @@ class RBY1Recorder:
         return action
 
     def disconnect(self):
-        """연결 해제
-        
-        종료 순서 (공식 17_teleoperation_with_joint_mapping.py 기준):
-          1. stop_state_update   ← 상태 콜백 먼저 중지
-          2. master_arm.stop_control()
-          3. cancel_control
-          4. sleep(0.5)          ← 명령 완료 대기
-          5. disable_control_manager
-          6. power_off
-          7. gripper.stop()      ← 그리퍼는 마지막
-        """
-        # 중복 호출 방지
-        if hasattr(self, '_disconnected') and self._disconnected:
-            return
-        self._disconnected = True
-        
-        # 시그널 핸들러 복원
-        self._restore_signal_handlers()
-        
-        # 로그 파일 닫기
-        self._close_log_file()
-        if self._log_dir:
-            print(f"✓ 로그 저장 완료: {self._log_dir}")
-            self._log_dir = None  # 중복 출력 방지
-        
-        # === 공식 순서 적용 ===
-        
-        # 1. 상태 업데이트 중지 (중복 호출 방지) ← 먼저!
-        if self.robot and not self._state_update_stopped:
-            try:
-                self.robot.stop_state_update()
-                self._state_update_stopped = True
-                print("✓ 상태 업데이트 중지")
-            except Exception:
-                pass
-        
-        # 2. 마스터 암 해제 (중복 호출 방지)
-        if self.master_arm is not None and not self._master_arm_stopped:
-            try:
-                self.master_arm.stop_control()
-                self._master_arm_stopped = True
-                print("✓ 마스터 암 연결 해제")
-            except Exception:
-                pass
-        
-        # 3-6. 텔레오퍼레이션 모드: 제어권 해제 (중복 호출 방지)
-        if self.use_teleop and self.robot:
-            try:
-                # 3. cancel_control
-                if not self._robot_control_cancelled:
-                    self.robot.cancel_control()
-                    self._robot_control_cancelled = True
-                # 4. sleep (공식: 0.5초)
-                time.sleep(0.5)
-                # 5. disable_control_manager
-                self.robot.disable_control_manager()
-                # 6. power_off
-                self.robot.power_off("12v")
-                print("✓ 제어권 해제")
-            except Exception:
-                pass
-        
-        # 7. 그리퍼 해제 ← 마지막!
+        """연결 해제"""
+        # 그리퍼 해제
         if self.gripper is not None:
             try:
                 self.gripper.stop()
@@ -1678,7 +1188,28 @@ class RBY1Recorder:
             except Exception:
                 pass
         
-        print("✓ 로봇 연결 해제 완료")
+        # 마스터 암 해제
+        if self.master_arm is not None:
+            try:
+                self.master_arm.stop_control()
+                print("✓ 마스터 암 연결 해제")
+            except Exception:
+                pass
+        
+        # 텔레오퍼레이션 모드: 제어권 해제
+        if self.use_teleop and self.robot:
+            try:
+                self.robot.cancel_control()
+                time.sleep(0.3)
+                self.robot.disable_control_manager()
+                self.robot.power_off("12v")
+                print("✓ 제어권 해제")
+            except Exception:
+                pass
+        
+        if self.robot:
+            self.robot.stop_state_update()
+            print("✓ 로봇 연결 해제")
 
         # 멀티 RealSense 카메라 해제
         if self.rs_pipelines:
@@ -2054,7 +1585,6 @@ class RBY1Recorder:
         print("  [ENTER] 에피소드 저장 & 다음으로")
         print("  [R]     현재 에피소드 취소 & 다시 녹화")
         print("  [B]     이전 에피소드 삭제 & 재녹화")
-        print("  [T]     Teleop 재연결 (Critical 해제 후)")
         print("  [Q]     종료")
         # 헤드 제어 기능 비활성화 (안전 문제로 제거됨)
         # if self.use_teleop:
@@ -2109,7 +1639,7 @@ class RBY1Recorder:
                 
                 # 에피소드 시작시 초기 자세로 이동 (teleop 모드 + reset 활성화시)
                 if self.use_teleop and self.reset_pose_each_episode:
-                    self.move_to_ready_pose(timeout=3.0)
+                    self.move_to_ready_pose(wait_time=3.0)
 
                 while not episode_done:
                     key = keyboard.get_key(timeout=0.05)
@@ -2185,15 +1715,6 @@ class RBY1Recorder:
                                 self._print_summary(output_name, episode_idx, total_frames, save_root)
                             return dataset
                         
-                        elif key.lower() == 't':  # T - Teleop 재연결
-                            if self._teleop_paused:
-                                print("\n🔄 Teleop 재연결 시도 중...")
-                                self._teleop_paused = False
-                                self._critical_reason = ""
-                                print("✓ Teleop 재연결됨. 녹화를 계속하려면 SPACE를 누르세요.")
-                            else:
-                                print("\n⚠ Teleop이 이미 활성화 상태입니다.")
-                        
                         # 헤드 제어 기능 비활성화 (안전 문제로 제거됨)
                         # elif self.use_teleop and self.command_stream is not None:
                         #     if key.lower() == 'w':  # W - 헤드 위로
@@ -2209,14 +1730,6 @@ class RBY1Recorder:
 
                     # 녹화 중일 때 프레임 수집
                     if recording:
-                        # Critical 상태 감지 시 녹화 일시정지
-                        if self._teleop_paused and self.use_teleop:
-                            recording = False
-                            print(f"\n🔴 [CRITICAL] {self._critical_reason}")
-                            print("   녹화 일시정지됨. 현재 에피소드 버퍼 유지.")
-                            print("   → [T] Teleop 재연결 후 [R] 재녹화 또는 [SPACE] 계속")
-                            continue
-                        
                         loop_start = time.perf_counter()
                         elapsed = time.time() - episode_start_time
 
