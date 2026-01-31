@@ -142,11 +142,22 @@ class TeleopSettings:
     impedance_torque_limit = 30.0     # (17_teleop 기본값: 30.0)
     
     # ========================================================================
-    # 안전 모니터링 임계값 (비활성화됨)
+    # 마스터 암 안전 모니터링 임계값
     # ========================================================================
-    # 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-    # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-    # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
+    # 마스터 암 모터 배치 (7개 관절 × 2팔):
+    #   관절 0-2: XM540-W150 (Stall 7.3Nm, 권장 연속 사용 ~3.5Nm)
+    #   관절 3-6: XM430-W210 (Stall 3.0Nm, 권장 연속 사용 ~1.5Nm)
+    # state.torque_joint = current × torque_constant (SDK에서 계산됨)
+    
+    # 마스터 암 토크 임계값 (Nm) - 관절별
+    ma_torque_warning = np.array([
+        2.5, 2.5, 2.5, 2.5, 1.0, 1.0, 1.0,  # 오른팔 (70% of limit)
+        2.5, 2.5, 2.5, 2.5, 1.0, 1.0, 1.0,  # 왼팔
+    ])
+    ma_torque_critical = np.array([
+        3.5, 3.5, 3.5, 3.5, 1.5, 1.5, 1.5,  # 오른팔 (MA_TORQUE_LIMIT과 동일)
+        3.5, 3.5, 3.5, 3.5, 1.5, 1.5, 1.5,  # 왼팔
+    ])
     
     # 하위 호환성용 (WebUI에서 사용할 수 있음)
     temp_warning = 60
@@ -174,7 +185,7 @@ class TeleopSettings:
 READY_POSE = {
     "A": {
         # ⚠️ 변경됨: 17_teleop 기본값 [0,45,-90,45,0,0] → Packing 자세 [0,80,-140,60,0,0]
-        "torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
+        "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
         "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),  # 17_teleop 기본값과 동일
         "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),   # 17_teleop 기본값과 동일
         # 전투모드 (주석):
@@ -430,11 +441,12 @@ class RBY1Recorder:
         self._robot_control_cancelled = False
         self._state_update_stopped = False
         
-        # 안전 모니터링: 비활성화됨 (17_teleop과 동일)
-        # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-        # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
-        self._teleop_paused = False  # 하위 호환성용 (현재 미사용)
-        self._critical_reason = ""   # 하위 호환성용 (현재 미사용)
+        # 안전 모니터링: 마스터 암 토크 기반
+        # state.torque_joint = current × torque_constant (SDK에서 계산됨)
+        self._teleop_paused = False  # Critical 감지 시 teleop 일시정지
+        self._critical_reason = ""   # 일시정지 사유
+        self._ma_warning_count = 0   # 경고 로그 빈도 제한용
+        self._ma_disconnect_requested = False  # 토크 과부하 시 마스터암 해제 요청
         
         # 로그 폴더/파일 설정 (시간 기반 폴더명)
         self._log_dir = None
@@ -511,11 +523,12 @@ class RBY1Recorder:
         self._log_dir = log_base / f"teleop_{timestamp}"
         self._log_dir.mkdir(parents=True, exist_ok=True)
         
-        # 텔레옵 로그 파일
+        # 텔레옵 로그 파일 (마스터암 상태 + 토크)
         log_path = self._log_dir / "teleop_state.log"
         self._log_file = open(log_path, "w")
         self._log_file.write(f"# Teleop State Log - {timestamp}\n")
-        self._log_file.write("# Format: timestamp,button_right,button_left,trigger_right,trigger_left\n")
+        self._log_file.write("# Format: timestamp,btn_R,btn_L,trig_R,trig_L,torque_R[0-6],torque_L[0-6]\n")
+        self._log_file.write("# Torque unit: Nm, XM540(0-2) limit 3.5Nm, XM430(3-6) limit 1.5Nm\n")
         self._log_file.flush()
         
         # 안전 이벤트 로그 파일 (경고/위험 기록)
@@ -528,13 +541,19 @@ class RBY1Recorder:
         print(f"📁 로그 폴더: {self._log_dir}")
     
     def _write_teleop_log(self, state):
-        """텔레옵 상태를 로그 파일에 기록"""
+        """텔레옵 상태를 로그 파일에 기록 (버튼 + 토크)"""
         if self._log_file is None:
             return
         
         try:
             timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            line = f"{timestamp},{state.button_right.button},{state.button_left.button},{state.button_right.trigger},{state.button_left.trigger}\n"
+            # 버튼/트리거 상태
+            btn_data = f"{state.button_right.button},{state.button_left.button},{state.button_right.trigger:.2f},{state.button_left.trigger:.2f}"
+            # 토크 데이터 (7개씩 오른팔/왼팔)
+            torque = state.torque_joint
+            torque_r = ",".join(f"{torque[i]:.3f}" for i in range(7))    # Right arm: 0-6
+            torque_l = ",".join(f"{torque[i]:.3f}" for i in range(7, 14))  # Left arm: 7-13
+            line = f"{timestamp},{btn_data},{torque_r},{torque_l}\n"
             self._log_file.write(line)
             self._log_file.flush()
         except Exception:
@@ -574,6 +593,90 @@ class RBY1Recorder:
                 self._safety_log_file = None
             except Exception:
                 pass
+
+    def _read_master_arm_motor_states(self, label: str = "snapshot"):
+        """마스터암 다이나믹셀 온도/전류 스냅샷
+        
+        MasterArm.State에는 torque_joint만 있고 temperature/current는 없음.
+        시작 전/종료 후에 DynamixelBus를 직접 열어 스냅샷 기록.
+        
+        Args:
+            label: 로그에 기록할 레이블 ("start", "end" 등)
+        """
+        bus = None
+        try:
+            bus = rby.DynamixelBus(rby.upc.MasterArmDeviceName)
+            motor_ids = list(range(14))  # 0-13: 14개 관절
+            
+            states = bus.get_motor_states(motor_ids)
+            if states is None:
+                self._write_safety_log("INFO", f"{label}: 마스터암 모터 상태 읽기 실패")
+                return None
+            
+            # 결과 파싱
+            motor_data = {}
+            for motor_id, ms in states:
+                motor_data[motor_id] = {
+                    'temperature': ms.temperature,
+                    'current': ms.current,
+                    'torque': ms.torque,
+                }
+            
+            # 로그 기록
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            temp_str = ",".join(f"{motor_data.get(i, {}).get('temperature', 0)}" for i in range(14))
+            curr_str = ",".join(f"{motor_data.get(i, {}).get('current', 0):.3f}" for i in range(14))
+            
+            self._write_safety_log("INFO", f"{label}: temp[0-13]={temp_str}")
+            self._write_safety_log("INFO", f"{label}: curr[0-13]={curr_str}")
+            
+            # 경고: 온도 50°C 이상
+            for i in range(14):
+                temp = motor_data.get(i, {}).get('temperature', 0)
+                if temp >= 50:
+                    arm = "Right" if i < 7 else "Left"
+                    joint = i if i < 7 else i - 7
+                    self._write_safety_log("WARNING", f"{label}: {arm} joint {joint} temperature {temp}°C >= 50°C")
+            
+            print(f"🌡️  마스터암 온도 ({label}): {temp_str}")
+            return motor_data
+            
+        except Exception as e:
+            self._write_safety_log("INFO", f"{label}: 마스터암 상태 읽기 오류 - {e}")
+            return None
+        finally:
+            # 버스 명시적 해제 (GC 대기 없이 즉시 해제)
+            if bus is not None:
+                del bus
+                time.sleep(0.1)  # 버스 해제 대기
+
+    def _disconnect_master_arm_safe(self):
+        """토크 과부하로 인한 마스터암 안전 해제 (별도 스레드에서 호출)
+        
+        콜백 내부에서 직접 stop_control() 호출 시 데드락 발생하므로
+        별도 스레드에서 안전하게 해제
+        """
+        if not self._ma_disconnect_requested:
+            return
+            
+        try:
+            # 잠시 대기 (콜백 완료 대기)
+            time.sleep(0.1)
+            
+            if self.master_arm is not None and not self._master_arm_stopped:
+                self.master_arm.stop_control()
+                self._master_arm_stopped = True
+                print("\n" + "=" * 60)
+                print("🛑 마스터암 토크 과부하로 연결 해제됨!")
+                print(f"   사유: {self._critical_reason}")
+                print("=" * 60)
+                self._write_safety_log("CRITICAL", "마스터암 연결 해제 완료")
+                
+                # 종료 시점 온도/전류 스냅샷
+                self._read_master_arm_motor_states("EMERGENCY_END")
+                
+        except Exception as e:
+            self._write_safety_log("CRITICAL", f"마스터암 해제 오류: {e}")
 
     def connect(self):
         """로봇 및 카메라, 마스터 암 연결"""
@@ -764,6 +867,7 @@ class RBY1Recorder:
                 "connected": self.master_arm is not None,
                 "joints": [],
                 "q_joint": [],
+                "torque_joint": [],  # 마스터 암 토크 (모니터링용)
                 "button_right": False,
                 "button_left": False,
                 "trigger_right": 0,
@@ -775,6 +879,10 @@ class RBY1Recorder:
                 "min_q": [],
                 "max_q": [],
             },
+            "safety": {
+                "teleop_paused": self._teleop_paused,
+                "critical_reason": self._critical_reason,
+            },
             "limits": {
                 "temp_warning": TeleopSettings.temp_warning,
                 "temp_critical": TeleopSettings.temp_critical,
@@ -782,6 +890,9 @@ class RBY1Recorder:
                 "current_critical": TeleopSettings.current_critical,
                 "torque_warning": TeleopSettings.torque_warning,
                 "torque_critical": TeleopSettings.torque_critical,
+                # 마스터 암 토크 임계값
+                "ma_torque_warning": TeleopSettings.ma_torque_warning.tolist(),
+                "ma_torque_critical": TeleopSettings.ma_torque_critical.tolist(),
             }
         }
         
@@ -790,21 +901,23 @@ class RBY1Recorder:
             if self.latest_state is not None:
                 state = self.latest_state
                 # joint_states에서 온도, 전류, 토크 읽기
-                if hasattr(state, 'temperature') and state.temperature:
-                    status["robot"]["temperature"] = list(state.temperature)
-                if hasattr(state, 'current') and state.current:
-                    status["robot"]["current"] = list(state.current)
-                if hasattr(state, 'torque') and state.torque:
-                    status["robot"]["torque"] = list(state.torque)
-                if hasattr(state, 'position') and state.position:
-                    status["robot"]["joints"] = list(state.position)
+                if hasattr(state, 'temperature') and state.temperature is not None and len(state.temperature) > 0:
+                    status["robot"]["temperature"] = [float(x) for x in state.temperature]
+                if hasattr(state, 'current') and state.current is not None and len(state.current) > 0:
+                    status["robot"]["current"] = [float(x) for x in state.current]
+                if hasattr(state, 'torque') and state.torque is not None and len(state.torque) > 0:
+                    status["robot"]["torque"] = [float(x) for x in state.torque]
+                if hasattr(state, 'position') and state.position is not None and len(state.position) > 0:
+                    status["robot"]["joints"] = [float(x) for x in state.position]
         
         # 마스터 암 상태
         with self.master_arm_lock:
             if self.master_arm_state is not None:
                 ma_state = self.master_arm_state
                 if hasattr(ma_state, 'q_joint'):
-                    status["master_arm"]["q_joint"] = list(ma_state.q_joint)
+                    status["master_arm"]["q_joint"] = [float(x) for x in ma_state.q_joint]
+                if hasattr(ma_state, 'torque_joint'):
+                    status["master_arm"]["torque_joint"] = [float(x) for x in ma_state.torque_joint]
                 if hasattr(ma_state, 'button_right'):
                     status["master_arm"]["button_right"] = bool(ma_state.button_right.button)
                     status["master_arm"]["trigger_right"] = int(ma_state.button_right.trigger)
@@ -815,11 +928,11 @@ class RBY1Recorder:
         # 그리퍼 상태
         if self.gripper is not None:
             if self.gripper.target_q is not None:
-                status["gripper"]["target_q"] = list(self.gripper.target_q)
+                status["gripper"]["target_q"] = [float(x) for x in self.gripper.target_q]
             if np.isfinite(self.gripper.min_q).all():
-                status["gripper"]["min_q"] = list(self.gripper.min_q)
+                status["gripper"]["min_q"] = [float(x) for x in self.gripper.min_q]
             if np.isfinite(self.gripper.max_q).all():
-                status["gripper"]["max_q"] = list(self.gripper.max_q)
+                status["gripper"]["max_q"] = [float(x) for x in self.gripper.max_q]
         
         return status
 
@@ -1052,21 +1165,17 @@ class RBY1Recorder:
                 print("✓ Position 모드 활성화")
             
             # ========================================================================
-            # ⚠️ 안전: 초기 자세로 이동 (17_teleop의 move_j처럼 블로킹)
+            # ⚠️ 안전: 초기 자세로 이동 (17_teleop의 move_j처럼 블로킹, Position 모드)
             # 로봇이 이동 중에 마스터 암 제어가 시작되면 충돌 위험!
             # ========================================================================
             print("초기 자세로 이동 중...")
             ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
-            self._send_ready_pose_stream(ready_pose, minimum_time=5.0)
             
-            # 초기 자세 도달까지 폴링 대기
-            pose_reached = self._wait_for_pose_reached(ready_pose, tolerance=0.05, timeout=10.0)
-            if not pose_reached:
-                # 사용자에게 경고하고 확인 요청
+            # 공식 17_teleop처럼 blocking으로 이동 (Position 모드)
+            if not self._move_j(ready_pose, minimum_time=5.0):
                 print("\n" + "=" * 60)
-                print("⚠️  경고: 초기 자세 도달 타임아웃!")
-                print("   로봇이 예상 위치에 도달하지 못했습니다.")
-                print("   현재 위치에서 시작하면 마스터 암과 동기화되지 않을 수 있습니다.")
+                print("⚠️  경고: 초기 자세 이동 실패!")
+                print("   SDK에서 FinishCode.Ok를 반환하지 않았습니다.")
                 print("=" * 60)
                 # 3초 대기 (사용자가 상황 인지하도록)
                 for i in range(3, 0, -1):
@@ -1096,6 +1205,10 @@ class RBY1Recorder:
             
             # 마스터 암 초기화
             rby.upc.initialize_device(rby.upc.MasterArmDeviceName)
+            
+            # ⚠️ 시작 시 온도 스냅샷 비활성화
+            # DynamixelBus를 열면 버스가 제대로 해제되지 않아 MasterArm.initialize() 실패
+            # 토크 데이터는 실시간으로 로깅됨, 온도는 종료 시에만 확인 가능
             
             # 마스터 암 URDF 경로 (17_teleop과 동일한 방식: 스크립트 상대경로 우선)
             # 1. 워크스페이스 내 rby1-sdk 경로
@@ -1171,6 +1284,47 @@ class RBY1Recorder:
                 pass
             self.command_stream = None
     
+    def _move_j(self, pose: dict, minimum_time: float = 5.0) -> bool:
+        """초기 자세로 이동 (공식 17_teleop의 move_j와 동일)
+        
+        블로킹 호출, Position 모드 사용 (Impedance 설정과 무관)
+        SDK의 handler.get()이 완료될 때까지 대기
+        """
+        # Position 모드 빌더 (17_teleop 기본값)
+        torso_builder = (
+            rby.JointPositionCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
+            .set_position(pose["torso"])
+            .set_minimum_time(minimum_time)
+        )
+        
+        right_arm_builder = (
+            rby.JointPositionCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
+            .set_position(pose["right_arm"])
+            .set_minimum_time(minimum_time)
+        )
+        
+        left_arm_builder = (
+            rby.JointPositionCommandBuilder()
+            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
+            .set_position(pose["left_arm"])
+            .set_minimum_time(minimum_time)
+        )
+        
+        cmd = rby.RobotCommandBuilder().set_command(
+            rby.ComponentBasedCommandBuilder().set_body_command(
+                rby.BodyComponentBasedCommandBuilder()
+                .set_torso_command(torso_builder)
+                .set_right_arm_command(right_arm_builder)
+                .set_left_arm_command(left_arm_builder)
+            )
+        )
+        
+        handler = self.robot.send_command(cmd)
+        result = handler.get()
+        return result == rby.RobotCommandFeedback.FinishCode.Ok
+
     def _send_ready_pose_stream(self, pose: dict, minimum_time: float = 5.0):
         """초기 자세로 이동 (command_stream 사용, 비블로킹)"""
         if self.command_stream is None:
@@ -1235,7 +1389,7 @@ class RBY1Recorder:
         
         self.command_stream.send_command(cmd)
     
-    def _wait_for_pose_reached(self, target_pose: dict, tolerance: float = 0.05, timeout: float = 10.0) -> bool:
+    def _wait_for_pose_reached(self, target_pose: dict, tolerance: float = 0.1, timeout: float = 10.0) -> bool:
         """목표 자세에 도달할 때까지 폴링 대기
         
         Args:
@@ -1289,11 +1443,10 @@ class RBY1Recorder:
         ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
         
         print("\n🔄 초기 자세로 이동 중...")
-        self._send_ready_pose_stream(ready_pose, minimum_time=2.0)
         
-        # 스마트 대기: 목표 도달시 즉시 진행
-        if not self._wait_for_pose_reached(ready_pose, tolerance=0.05, timeout=timeout):
-            print("   ⚠ 타임아웃 - 현재 위치에서 진행")
+        # 공식 17_teleop처럼 blocking으로 이동 (Position 모드)
+        if not self._move_j(ready_pose, minimum_time=2.0):
+            print("   ⚠ 이동 실패 - 현재 위치에서 진행")
         
         # 마스터 암 목표 위치도 초기화
         if self.master_arm is not None:
@@ -1408,10 +1561,44 @@ class RBY1Recorder:
             self.master_arm_state = state
         
         # ========================================================================
-        # 안전 모니터링: 비활성화됨
-        # 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-        # 마스터 암 상태(state)에는 temperature/current/torque 필드 없음
+        # 마스터 암 토크 모니터링 (state.torque_joint 사용)
         # ========================================================================
+        if hasattr(state, 'torque_joint') and state.torque_joint is not None:
+            ma_torques = np.abs(np.array(state.torque_joint))
+            
+            # Critical 체크
+            over_critical = ma_torques > TeleopSettings.ma_torque_critical
+            if np.any(over_critical):
+                critical_idx = np.where(over_critical)[0][0]
+                if not self._teleop_paused:
+                    self._teleop_paused = True
+                    arm_name = "Right" if critical_idx < 7 else "Left"
+                    joint_idx = critical_idx if critical_idx < 7 else critical_idx - 7
+                    self._critical_reason = f"마스터암 토크 과부하! {arm_name} joint {joint_idx}: {ma_torques[critical_idx]:.2f}Nm (limit: {TeleopSettings.ma_torque_critical[critical_idx]:.2f}Nm)"
+                    logging.critical(self._critical_reason)
+                    self._write_safety_log("CRITICAL", self._critical_reason)
+                    # 마스터암 해제 요청 (콜백 내부에서 직접 stop_control 호출하면 데드락)
+                    self._ma_disconnect_requested = True
+                    # 별도 스레드에서 안전하게 해제
+                    import threading
+                    threading.Thread(target=self._disconnect_master_arm_safe, daemon=True).start()
+            else:
+                # Warning 체크 (1초에 1회만 로그)
+                over_warning = ma_torques > TeleopSettings.ma_torque_warning
+                if np.any(over_warning):
+                    self._ma_warning_count += 1
+                    if self._ma_warning_count >= round(1 / TeleopSettings.master_arm_loop_period):
+                        warning_idx = np.where(over_warning)[0][0]
+                        warning_msg = f"마스터암 토크 경고: 관절 {warning_idx}: {ma_torques[warning_idx]:.2f}Nm"
+                        logging.warning(warning_msg)
+                        self._write_safety_log("WARNING", warning_msg)
+                        self._ma_warning_count = 0
+                else:
+                    self._ma_warning_count = 0
+        
+        # Teleop 일시정지 상태면 기본 입력만 반환 (로봇 위치 유지)
+        if self._teleop_paused:
+            return rby.upc.MasterArm.ControlInput()
         
         # 로그 파일에 저장 (17_teleop과 동일: 매초 버튼/트리거 상태)
         self._ma_log_count += 1
@@ -1455,7 +1642,7 @@ class RBY1Recorder:
         # 오른팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
         if state.button_right.button == 1:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[0:7] = torque[0:7] * 0.6  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[0:7] = torque[0:7] * 0.4  # 17_teleop 기본값: 0.6
             self.right_q = np.array(state.q_joint[0:7])
         else:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -1465,7 +1652,7 @@ class RBY1Recorder:
         # 왼팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
         if state.button_left.button == 1:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[7:14] = torque[7:14] * 0.6  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[7:14] = torque[7:14] * 0.4  # 17_teleop 기본값: 0.6
             self.left_q = np.array(state.q_joint[7:14])
         else:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -1650,6 +1837,8 @@ class RBY1Recorder:
                 self.master_arm.stop_control()
                 self._master_arm_stopped = True
                 print("✓ 마스터 암 연결 해제")
+                # 종료 후 온도/전류 스냅샷 (다이나믹셀 문제 분석용)
+                self._read_master_arm_motor_states("END")
             except Exception:
                 pass
         
@@ -1787,23 +1976,31 @@ class RBY1Recorder:
 
         # 멀티 RealSense 카메라 이미지
         if self.rs_pipelines:
-            try:
-                import pyrealsense2 as rs
-                for cam_name, (pipeline, _) in self.rs_pipelines.items():
-                    try:
-                        frames = pipeline.wait_for_frames(timeout_ms=100)
-                        color_frame = frames.get_color_frame()
-                        if color_frame:
-                            frame_rgb = np.asanyarray(color_frame.get_data())
-                            obs[cam_name] = frame_rgb
-                            # 웹 스트리밍용 버퍼에 저장
-                            if self.stream_port > 0:
-                                with self.stream_lock:
-                                    self.stream_frames[cam_name] = frame_rgb.copy()
-                    except Exception:
-                        pass  # 개별 카메라 실패시 무시
-            except Exception as e:
-                pass  # 전체 카메라 실패시 무시
+            # 스트리밍 중이면 stream_frames에서 가져오기 (레이스 컨디션 방지)
+            if self.stream_port > 0 and hasattr(self, '_stream_capture_threads') and self._stream_capture_threads:
+                with self.stream_lock:
+                    for cam_name in self.rs_pipelines.keys():
+                        if cam_name in self.stream_frames:
+                            obs[cam_name] = self.stream_frames[cam_name].copy()
+                        else:
+                            obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
+            else:
+                # 스트리밍 안 할 때는 직접 캡처
+                try:
+                    import pyrealsense2 as rs
+                    for cam_name, (pipeline, _) in self.rs_pipelines.items():
+                        try:
+                            frames = pipeline.wait_for_frames(timeout_ms=100)
+                            color_frame = frames.get_color_frame()
+                            if color_frame:
+                                frame_rgb = np.asanyarray(color_frame.get_data())
+                                obs[cam_name] = frame_rgb
+                            else:
+                                obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
+                        except Exception:
+                            obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
+                except Exception as e:
+                    pass  # 전체 카메라 실패시 무시
         elif self.camera is not None:
             # 일반 USB 카메라
             import cv2

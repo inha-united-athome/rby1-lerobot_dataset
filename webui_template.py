@@ -179,6 +179,10 @@ def get_javascript(limits: dict) -> str:
     torq_warn_arr = limits.get('torque_warning_per_joint', [0.8]*14)
     torq_crit_arr = limits.get('torque_critical_per_joint', [1.5]*14)
     
+    # 마스터 암 토크 임계값
+    ma_torq_warn_arr = limits.get('ma_torque_warning', [2.5,2.5,2.5,1.0,1.0,1.0,1.0]*2)
+    ma_torq_crit_arr = limits.get('ma_torque_critical', [3.5,3.5,3.5,1.5,1.5,1.5,1.5]*2)
+    
     return f"""
 // 온도 임계값 (모든 모터 동일)
 const TEMP_WARN = {limits.get('temp_warning', 60)};
@@ -190,6 +194,10 @@ const CURR_WARN_ARR = {json.dumps(list(curr_warn_arr))};
 const CURR_CRIT_ARR = {json.dumps(list(curr_crit_arr))};
 const TORQ_WARN_ARR = {json.dumps(list(torq_warn_arr))};
 const TORQ_CRIT_ARR = {json.dumps(list(torq_crit_arr))};
+
+// 마스터 암 토크 임계값 배열 (14개: r_arm 0-6, l_arm 0-6)
+const MA_TORQ_WARN_ARR = {json.dumps(list(ma_torq_warn_arr))};
+const MA_TORQ_CRIT_ARR = {json.dumps(list(ma_torq_crit_arr))};
 
 // 하위 호환성: 단일 값 (표시용)
 const CURR_WARN = {limits.get('current_warning', 1.5)};
@@ -299,6 +307,16 @@ function getTorqueBarClass(torq, j) {{
     return 'bar-ok';
 }}
 
+// 마스터 암 토크 임계값 (j: 0-13 관절 인덱스)
+function getMATorqueClass(torq, j) {{
+    const crit = MA_TORQ_CRIT_ARR[j] || 1.5;
+    const warn = MA_TORQ_WARN_ARR[j] || 1.0;
+    const absTorq = Math.abs(torq);
+    if (absTorq >= crit) return 'val-critical';
+    if (absTorq >= warn) return 'val-warn';
+    return 'val-ok';
+}}
+
 function updateStatus() {{
     fetch('/api/status')
         .then(r => r.json())
@@ -406,13 +424,29 @@ function updateStatus() {{
             document.getElementById('trigger-right').textContent = data.master_arm.trigger_right;
             document.getElementById('trigger-left').textContent = data.master_arm.trigger_left;
             
-            // 마스터 암 관절
+            // 안전 상태 표시
+            const safetyBadge = document.getElementById('safety-status');
+            if (data.safety && data.safety.teleop_paused) {{
+                safetyBadge.className = 'status-badge error';
+                safetyBadge.textContent = '⚠ ' + (data.safety.critical_reason || 'PAUSED');
+                hasCritical = true;
+            }} else {{
+                safetyBadge.className = 'status-badge ok';
+                safetyBadge.textContent = '✓ 정상';
+            }}
+            
+            // 마스터 암 관절 (토크 포함)
             if (data.master_arm.q_joint && data.master_arm.q_joint.length >= 14) {{
                 let rightHtml = '';
                 let leftHtml = '';
+                const hasTorque = data.master_arm.torque_joint && data.master_arm.torque_joint.length >= 14;
                 for (let i = 0; i < 7; i++) {{
-                    rightHtml += `<tr><td>${{i}}</td><td class="val">${{data.master_arm.q_joint[i].toFixed(3)}}</td></tr>`;
-                    leftHtml += `<tr><td>${{i}}</td><td class="val">${{data.master_arm.q_joint[i+7].toFixed(3)}}</td></tr>`;
+                    const rTorque = hasTorque ? data.master_arm.torque_joint[i] : 0;
+                    const lTorque = hasTorque ? data.master_arm.torque_joint[i+7] : 0;
+                    const rTorqueClass = getMATorqueClass(rTorque, i);
+                    const lTorqueClass = getMATorqueClass(lTorque, i+7);
+                    rightHtml += `<tr><td>${{i}}</td><td class="val">${{data.master_arm.q_joint[i].toFixed(3)}}</td><td class="val ${{rTorqueClass}}">${{rTorque.toFixed(2)}}</td></tr>`;
+                    leftHtml += `<tr><td>${{i}}</td><td class="val">${{data.master_arm.q_joint[i+7].toFixed(3)}}</td><td class="val ${{lTorqueClass}}">${{lTorque.toFixed(2)}}</td></tr>`;
                 }}
                 document.getElementById('ma-right-joints').innerHTML = rightHtml;
                 document.getElementById('ma-left-joints').innerHTML = leftHtml;
@@ -499,6 +533,7 @@ def generate_html(camera_divs: str, stream_port: int, limits: dict = None) -> st
     <div class="header">
         <h1>🤖 RBY1 Monitor</h1>
         <div>
+            <span class="status-badge ok" id="safety-status">✓ 정상</span>
             <button id="alarm-toggle" class="alarm-btn on" onclick="toggleAlarm()">🔊 Alarm ON</button>
             <span class="status-badge ok" id="connection-status">● Connected</span>
             <span id="update-time"></span>
@@ -553,7 +588,7 @@ def generate_html(camera_divs: str, stream_port: int, limits: dict = None) -> st
                     <h4><span class="btn-indicator btn-off" id="btn-right"></span>Right Arm</h4>
                     <div>Trigger: <span class="val" id="trigger-right">0</span></div>
                     <table class="motor-table" style="margin-top:8px;">
-                        <thead><tr><th>J</th><th>Position (rad)</th></tr></thead>
+                        <thead><tr><th>J</th><th>Pos (rad)</th><th>Torque (Nm)</th></tr></thead>
                         <tbody id="ma-right-joints"></tbody>
                     </table>
                 </div>
@@ -561,7 +596,7 @@ def generate_html(camera_divs: str, stream_port: int, limits: dict = None) -> st
                     <h4><span class="btn-indicator btn-off" id="btn-left"></span>Left Arm</h4>
                     <div>Trigger: <span class="val" id="trigger-left">0</span></div>
                     <table class="motor-table" style="margin-top:8px;">
-                        <thead><tr><th>J</th><th>Position (rad)</th></tr></thead>
+                        <thead><tr><th>J</th><th>Pos (rad)</th><th>Torque (Nm)</th></tr></thead>
                         <tbody id="ma-left-joints"></tbody>
                     </table>
                 </div>
