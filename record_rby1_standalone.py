@@ -94,6 +94,10 @@ WHEEL_JOINTS = [
     "wheel_1",  # 오른쪽 휠
 ]
 
+# 그리퍼 방향 설정 (공식 SDK 17_teleoperation_with_joint_mapping.py와 동일)
+# False: trigger 0→1000이 열림→닫힘 (기본값)
+# True: trigger 0→1000이 닫힘→열림
+GRIPPER_DIRECTION = False
 
 # ============================================================================
 # 텔레오퍼레이션 설정 (SDK에서 가져옴)
@@ -152,6 +156,7 @@ class Gripper:
         self.min_q = np.array([np.inf, np.inf])
         self.max_q = np.array([-np.inf, -np.inf])
         self.target_q = None
+        self.current_q = np.array([0.0, 0.0])  # 현재 인코더 위치 (raw)
         self._running = False
         self._thread = None
     
@@ -218,9 +223,15 @@ class Gripper:
         self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
         print(f"✓ 그리퍼 홈 완료 (범위: {self.min_q} ~ {self.max_q})")
     
-    def set_target(self, target: np.ndarray):
-        """그리퍼 목표 위치 설정 (0-1 범위)"""
-        self.target_q = self.min_q + (self.max_q - self.min_q) * np.clip(target, 0, 1)
+    def set_target(self, normalized_q: np.ndarray):
+        """그리퍼 목표 위치 설정 (0-1 범위, 공식 SDK와 동일)"""
+        if not np.isfinite(self.min_q).all() or not np.isfinite(self.max_q).all():
+            return
+        normalized_q = np.clip(normalized_q, 0, 1)
+        if GRIPPER_DIRECTION:
+            self.target_q = normalized_q * (self.max_q - self.min_q) + self.min_q
+        else:
+            self.target_q = (1 - normalized_q) * (self.max_q - self.min_q) + self.min_q
     
     def start(self):
         """그리퍼 제어 스레드 시작"""
@@ -234,18 +245,46 @@ class Gripper:
         if self._thread:
             self._thread.join(timeout=1.0)
     
+    @property
+    def normalized_position(self) -> np.ndarray:
+        """현재 그리퍼 위치를 0~1 범위로 정규화 (action과 동일한 방향)
+        
+        GRIPPER_DIRECTION에 따라 방향이 결정됨:
+          False(기본): 0=열림, 1=닫힘 (trigger 값과 동일)
+          True: 0=닫힘, 1=열림
+        """
+        if not np.isfinite(self.min_q).all() or not np.isfinite(self.max_q).all():
+            return np.array([0.0, 0.0])
+        range_q = self.max_q - self.min_q
+        safe_range = np.where(np.abs(range_q) < 1e-6, 1.0, range_q)
+        raw_normalized = np.clip((self.current_q - self.min_q) / safe_range, 0.0, 1.0)
+        if GRIPPER_DIRECTION:
+            return raw_normalized
+        else:
+            return 1.0 - raw_normalized
+
     def _control_loop(self):
-        """그리퍼 제어 루프 (99_teleoperation과 동일)"""
+        """그리퍼 제어 루프 + 인코더 읽기"""
         self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
-        self.bus.group_sync_write_send_torque([(dev_id, 5) for dev_id in [0, 1]])
+        self.bus.group_sync_write_send_torque([(dev_id, 0.5) for dev_id in [0, 1]])
         while self._running:
-            if self.bus and self.target_q is not None:
+            if self.bus:
+                # 현재 인코더 위치 읽기
                 try:
-                    self.bus.group_sync_write_send_position(
-                        [(dev_id, q) for dev_id, q in enumerate(self.target_q.tolist())]
-                    )
+                    rv = self.bus.group_fast_sync_read_encoder([0, 1])
+                    if rv is not None:
+                        for dev_id, enc in rv:
+                            self.current_q[dev_id] = enc
                 except Exception:
                     pass
+                # 목표 위치 쓰기
+                if self.target_q is not None:
+                    try:
+                        self.bus.group_sync_write_send_position(
+                            [(dev_id, q) for dev_id, q in enumerate(self.target_q.tolist())]
+                        )
+                    except Exception:
+                        pass
             time.sleep(0.1)  # 10Hz (99_teleoperation과 동일)
 
 
@@ -1243,34 +1282,52 @@ class RBY1Recorder:
                         obs[f"{wheel_name}.vel"] = 0.0
                         obs[f"{wheel_name}.torque"] = 0.0
 
-            # 그리퍼 상태 (tool_state에서 가져오기)
-            try:
-                if hasattr(state, 'tool_state') and state.tool_state is not None:
-                    tool = state.tool_state
-                    if self.arms in ["right", "both"]:
-                        if hasattr(tool, 'right_gripper_position'):
-                            obs["right_gripper.pos"] = float(tool.right_gripper_position)
-                        elif hasattr(tool, 'right_tool_position'):
-                            obs["right_gripper.pos"] = float(tool.right_tool_position)
+            # 그리퍼 상태: Gripper 객체(Dynamixel 인코더)에서 실제 위치 읽기
+            # tool_state는 RBY1에서 그리퍼 위치를 제공하지 않으므로 직접 읽음
+            gripper_pos = None
+            if self.gripper is not None:
+                try:
+                    gripper_pos = self.gripper.normalized_position  # [right, left] 0~1
+                except Exception:
+                    gripper_pos = None
+
+            if self.arms in ["right", "both"]:
+                if gripper_pos is not None:
+                    obs["right_gripper.pos"] = float(gripper_pos[0])
+                else:
+                    # fallback: tool_state 시도
+                    try:
+                        if hasattr(state, 'tool_state') and state.tool_state is not None:
+                            tool = state.tool_state
+                            if hasattr(tool, 'right_gripper_position'):
+                                obs["right_gripper.pos"] = float(tool.right_gripper_position)
+                            elif hasattr(tool, 'right_tool_position'):
+                                obs["right_gripper.pos"] = float(tool.right_tool_position)
+                            else:
+                                obs["right_gripper.pos"] = 0.0
                         else:
                             obs["right_gripper.pos"] = 0.0
-                    if self.arms in ["left", "both"]:
-                        if hasattr(tool, 'left_gripper_position'):
-                            obs["left_gripper.pos"] = float(tool.left_gripper_position)
-                        elif hasattr(tool, 'left_tool_position'):
-                            obs["left_gripper.pos"] = float(tool.left_tool_position)
+                    except Exception:
+                        obs["right_gripper.pos"] = 0.0
+
+            if self.arms in ["left", "both"]:
+                if gripper_pos is not None:
+                    obs["left_gripper.pos"] = float(gripper_pos[1])
+                else:
+                    # fallback: tool_state 시도
+                    try:
+                        if hasattr(state, 'tool_state') and state.tool_state is not None:
+                            tool = state.tool_state
+                            if hasattr(tool, 'left_gripper_position'):
+                                obs["left_gripper.pos"] = float(tool.left_gripper_position)
+                            elif hasattr(tool, 'left_tool_position'):
+                                obs["left_gripper.pos"] = float(tool.left_tool_position)
+                            else:
+                                obs["left_gripper.pos"] = 0.0
                         else:
                             obs["left_gripper.pos"] = 0.0
-                else:
-                    if self.arms in ["right", "both"]:
-                        obs["right_gripper.pos"] = 0.0
-                    if self.arms in ["left", "both"]:
+                    except Exception:
                         obs["left_gripper.pos"] = 0.0
-            except Exception:
-                if self.arms in ["right", "both"]:
-                    obs["right_gripper.pos"] = 0.0
-                if self.arms in ["left", "both"]:
-                    obs["left_gripper.pos"] = 0.0
 
             # EEF pose 계산
             if self.dyn_robot is not None:

@@ -116,7 +116,72 @@ python replay_rby1_standalone.py -d rby1_20260107_061029 --frames 0-10
 | `--dataset`, `-d` | Dataset name to inspect |
 | `--verbose` | Verbose data output |
 | `--frames` | Frame range to output (e.g., `0-10`) |
-| `--replay` | Replay on robot (TODO) |
+| `--show-camera` | Camera image visualization |
+| `--save-images` | Save camera images to files |
+
+---
+
+## ▶️ Robot Replay (replay_rby1_standalone.py --replay)
+
+Replay recorded actions on the robot. Supports arm joints + gripper + initial torso pose.
+
+### Basic Usage
+
+```bash
+# Replay episode 0 (both arms + gripper)
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --address 192.168.30.1:50051
+
+# Replay specific episode
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --episode 3
+
+# Replay at half speed
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --speed 0.5
+
+# Replay right arm only, no gripper
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --arms right --no-gripper
+
+# Set initial torso pose before replay (preset)
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --torso packing
+
+# Set initial torso pose (custom angles in degrees, 6 values)
+python replay_rby1_standalone.py -d rby1_20260107_061029 --replay --torso "0,55,-110,50,0,0"
+```
+
+### Replay Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--replay` | flag | false | Enable robot replay |
+| `--address` | str | `192.168.30.1:50051` | Robot address |
+| `--episode`, `-e` | int | `0` | Episode number to replay |
+| `--arms` | str | `both` | Arms to replay: `right`, `left`, `both` |
+| `--speed` | float | `1.0` | Playback speed multiplier |
+| `--no-gripper` | flag | false | Disable gripper control |
+| `--torso` | str | None | Initial torso pose: `ready`, `packing`, or 6 angles in degrees |
+
+### Torso Presets
+
+| Preset | Angles (deg) | Description |
+|--------|-------------|-------------|
+| `ready` | `0, 45, -90, 45, 0, 0` | Standard upright pose |
+| `packing` | `0, 80, -140, 60, 0, 0` | Bent forward for table tasks |
+| *(custom)* | e.g. `0,55,-110,50,0,0` | Any 6 comma-separated degree values |
+
+### Replay Sequence
+
+1. Connect to robot, power/servo on, enable control manager
+2. Initialize gripper (homing) if enabled
+3. Move torso to initial pose (if `--torso` specified, 5 sec)
+4. Move arms to first frame position (5 sec)
+5. Replay action frames at dataset FPS × speed
+6. Ctrl+C to safely stop at any time
+
+### Safety Notes
+
+- `control_hold_time=1`: If the program crashes, the robot releases after **1 second**
+- First frame movement takes **5 seconds** (slow approach)
+- Gripper torque is set to **0.5** (gentle grip)
+- Ctrl+C gracefully stops replay and releases gripper
 
 ---
 
@@ -194,7 +259,18 @@ python replay_rby1_standalone.py --list
 python replay_rby1_standalone.py -d rby1_20260107_123456 --verbose --frames 0-5
 ```
 
-### 3. Train Policy (using LeRobot)
+### 3. Replay on Robot
+
+```bash
+# Replay episode 0 with packing torso pose
+python replay_rby1_standalone.py \
+    -d rby1_20260107_123456 \
+    --replay \
+    --torso packing \
+    --speed 0.8
+```
+
+### 4. Train Policy (using LeRobot)
 
 ```bash
 # ACT policy training example

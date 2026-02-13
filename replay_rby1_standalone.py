@@ -25,13 +25,24 @@ RBY1 LeRobot 데이터셋 읽기 및 재생 스크립트
 import argparse
 import os
 import sys
+import time
+import signal
+import threading
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
 
+try:
+    import rby1_sdk as rby
+except ImportError:
+    rby = None
+
 # LeRobot 데이터셋
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+# 그리퍼 방향 설정 (record_rby1_standalone.py와 동일하게 맞출 것)
+GRIPPER_DIRECTION = False
 
 
 # 기본 데이터셋 경로
@@ -315,6 +326,15 @@ def main():
   # 프레임 데이터 상세 출력
   python replay_rby1_standalone.py --dataset rby1_20260106_082056 --frames 0-5 --verbose
 
+  # 로봇에 재생
+  python replay_rby1_standalone.py --dataset rby1_20260106_082056 --replay --address 192.168.30.1:50051
+
+  # 특정 에피소드, 속도 조절, 그리퍼 포함
+  python replay_rby1_standalone.py -d rby1_20260106_082056 --replay --episode 2 --speed 0.5
+
+  # 오른팔만 재생, 그리퍼 없이
+  python replay_rby1_standalone.py -d rby1_20260106_082056 --replay --arms right --no-gripper
+
   # 카메라 이미지 보기
   python replay_rby1_standalone.py --dataset rby1_20260106_082056 --show-camera
 
@@ -338,9 +358,21 @@ def main():
     parser.add_argument("--save-images", action="store_true",
                         help="카메라 이미지 파일로 저장 (--show-camera와 함께 사용)")
     parser.add_argument("--replay", action="store_true",
-                        help="로봇에 재생 (미구현)")
+                        help="로봇에 데이터셋 action 재생")
     parser.add_argument("--address", type=str, default="192.168.30.1:50051",
                         help="로봇 주소 (재생시)")
+    parser.add_argument("--episode", "-e", type=int, default=0,
+                        help="재생할 에피소드 번호 (기본: 0)")
+    parser.add_argument("--arms", type=str, default="both",
+                        choices=["right", "left", "both"],
+                        help="재생할 팔 (기본: both)")
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="재생 속도 배수 (기본: 1.0)")
+    parser.add_argument("--no-gripper", action="store_true",
+                        help="그리퍼 제어 비활성화")
+    parser.add_argument("--torso", type=str, default=None,
+                        help="초기 torso 자세 설정. 프리셋: 'ready'(45,-90,45), 'packing'(80,-140,60) "
+                             "또는 6개 각도(deg) 직접 입력: '0,80,-140,60,0,0'")
 
     args = parser.parse_args()
 
@@ -393,10 +425,407 @@ def main():
         # verbose 모드면 첫 프레임 출력
         show_frames(ds, 0, 1, verbose=True)
 
-    # 재생 (TODO)
+    # 재생
     if args.replay:
-        print("\n⚠️  로봇 재생 기능은 아직 구현되지 않았습니다.")
-        print("    추후 RBY1 SDK command builder를 사용하여 구현 예정")
+        # torso 파싱
+        torso_pose = None
+        if args.torso:
+            torso_pose = _parse_torso(args.torso)
+            if torso_pose is None:
+                print(f"❌ torso 입력 오류: {args.torso}")
+                return
+        replay_on_robot(
+            ds, args.address,
+            episode=args.episode,
+            arms=args.arms,
+            speed=args.speed,
+            use_gripper=not args.no_gripper,
+            torso_pose=torso_pose,
+        )
+        return
+
+
+# ============================================================================
+# 로봇 재생 기능
+# ============================================================================
+
+# Torso 프리셋 (degree)
+TORSO_PRESETS = {
+    "ready":   [0.0, 45.0, -90.0, 45.0, 0.0, 0.0],
+    "packing": [0.0, 80.0, -140.0, 60.0, 0.0, 0.0],
+}
+
+
+def _parse_torso(value: str):
+    """
+    torso 인자 파싱:
+      프리셋 이름 ('ready', 'packing') 또는
+      6개 각도(deg) 쉼표 구분 ('0,80,-140,60,0,0')
+    반환: np.ndarray (radian, 6개) 또는 None
+    """
+    key = value.strip().lower()
+    if key in TORSO_PRESETS:
+        return np.deg2rad(TORSO_PRESETS[key])
+    try:
+        angles = [float(x.strip()) for x in value.split(",")]
+        if len(angles) != 6:
+            print(f"❌ torso는 6개 값이 필요합니다 (head_0, torso_0~4). 입력: {len(angles)}개")
+            return None
+        return np.deg2rad(angles)
+    except ValueError:
+        return None
+
+
+class ReplayGripper:
+    """재생용 그리퍼 제어 클래스 (record_rby1_standalone.py Gripper와 동일 구조)"""
+
+    def __init__(self):
+        self.bus = None
+        self.min_q = np.array([np.inf, np.inf])
+        self.max_q = np.array([-np.inf, -np.inf])
+        self.target_q = None
+        self._running = False
+        self._thread = None
+
+    def initialize(self):
+        try:
+            self.bus = rby.DynamixelBus(rby.upc.GripperDeviceName)
+            self.bus.open_port()
+            self.bus.set_baud_rate(2_000_000)
+            self.bus.set_torque_constant([1, 1])
+            rv = True
+            for dev_id in [0, 1]:
+                if not self.bus.ping(dev_id):
+                    print(f"⚠ Dynamixel ID {dev_id} 응답 없음")
+                    rv = False
+            if rv:
+                self.bus.group_sync_write_torque_enable([(dev_id, 1) for dev_id in [0, 1]])
+                print("✓ 그리퍼 초기화 완료")
+            return rv
+        except Exception as e:
+            print(f"⚠ 그리퍼 초기화 실패: {e}")
+            return False
+
+    def set_operating_mode(self, mode):
+        if self.bus is None:
+            return
+        self.bus.group_sync_write_torque_enable([(dev_id, 0) for dev_id in [0, 1]])
+        self.bus.group_sync_write_operating_mode([(dev_id, mode) for dev_id in [0, 1]])
+        self.bus.group_sync_write_torque_enable([(dev_id, 1) for dev_id in [0, 1]])
+
+    def homing(self):
+        if self.bus is None:
+            return
+        self.set_operating_mode(rby.DynamixelBus.CurrentControlMode)
+        direction = 0
+        q = np.array([0, 0], dtype=np.float64)
+        prev_q = np.array([0, 0], dtype=np.float64)
+        counter = 0
+        while direction < 2:
+            self.bus.group_sync_write_send_torque(
+                [(dev_id, 0.5 * (1 if direction == 0 else -1)) for dev_id in [0, 1]]
+            )
+            rv = self.bus.group_fast_sync_read_encoder([0, 1])
+            if rv is not None:
+                for dev_id, enc in rv:
+                    q[dev_id] = enc
+            self.min_q = np.minimum(self.min_q, q)
+            self.max_q = np.maximum(self.max_q, q)
+            if np.array_equal(prev_q, q):
+                counter += 1
+            prev_q = q.copy()
+            if counter >= 30:
+                direction += 1
+                counter = 0
+            time.sleep(0.1)
+        self.target_q = self.max_q.copy()
+        self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
+        print(f"✓ 그리퍼 홈 완료 (범위: {self.min_q} ~ {self.max_q})")
+
+    def set_target(self, normalized_q: np.ndarray):
+        """normalized_q: [right, left] 0~1 범위 (record와 동일한 방향)"""
+        if not np.isfinite(self.min_q).all() or not np.isfinite(self.max_q).all():
+            return
+        normalized_q = np.clip(normalized_q, 0, 1)
+        if GRIPPER_DIRECTION:
+            self.target_q = normalized_q * (self.max_q - self.min_q) + self.min_q
+        else:
+            self.target_q = (1 - normalized_q) * (self.max_q - self.min_q) + self.min_q
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._control_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1.0)
+
+    def _control_loop(self):
+        self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
+        self.bus.group_sync_write_send_torque([(dev_id, 0.5) for dev_id in [0, 1]])
+        while self._running:
+            if self.bus and self.target_q is not None:
+                try:
+                    self.bus.group_sync_write_send_position(
+                        [(dev_id, q) for dev_id, q in enumerate(self.target_q.tolist())]
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.1)
+
+
+def replay_on_robot(ds: LeRobotDataset, address: str, episode: int = 0,
+                    arms: str = "both", speed: float = 1.0, use_gripper: bool = True,
+                    torso_pose: np.ndarray | None = None):
+    """
+    데이터셋의 action을 로봇에 재생
+
+    action 벡터 구조 (arms="both" 기준):
+      [0:7]  = right_arm 관절 (7개)
+      [7:14] = left_arm 관절 (7개)
+      [14]   = right_gripper (1개)
+      [15]   = left_gripper (1개)
+
+    arms="right": [0:7] right_arm + [7] right_gripper
+    arms="left":  [0:7] left_arm  + [7] left_gripper
+    """
+    if rby is None:
+        print("❌ rby1_sdk를 찾을 수 없습니다. UPC에서 실행하세요.")
+        return
+
+    # ===== 에피소드 추출 =====
+    episode_indices = [i for i in range(len(ds)) if ds[i].get("episode_index", -1) == episode]
+    if not episode_indices:
+        # episode_index 기반 필터가 안 되면 from/to 사용
+        if hasattr(ds, 'episode_data_index'):
+            ep_from = ds.episode_data_index["from"][episode].item()
+            ep_to = ds.episode_data_index["to"][episode].item()
+            episode_indices = list(range(ep_from, ep_to))
+        else:
+            print(f"❌ 에피소드 {episode}를 찾을 수 없습니다.")
+            return
+
+    total_frames = len(episode_indices)
+    dt = 1.0 / ds.fps  # 프레임 간격
+    print(f"\n재생 정보:")
+    print(f"  에피소드: {episode}")
+    print(f"  프레임 수: {total_frames}")
+    print(f"  FPS: {ds.fps}")
+    print(f"  예상 시간: {total_frames * dt / speed:.1f}초 (speed={speed}x)")
+    print(f"  팔: {arms}")
+    print(f"  그리퍼: {'사용' if use_gripper else '미사용'}")
+
+    # ===== 로봇 연결 =====
+    print(f"\n로봇 연결 중: {address}")
+    robot = rby.create_robot_a(address)
+    if not robot.connect():
+        print("❌ 로봇 연결 실패")
+        return
+
+    if not robot.is_power_on(".*"):
+        if not robot.power_on(".*"):
+            print("❌ 전원 켜기 실패")
+            return
+        print("✓ 전원 ON")
+
+    if not robot.is_servo_on(".*"):
+        if not robot.servo_on(".*"):
+            print("❌ 서보 활성화 실패")
+            return
+        print("✓ 서보 ON")
+
+    control_manager_state = robot.get_control_manager_state()
+    if control_manager_state.state in (
+        rby.ControlManagerState.State.MinorFault,
+        rby.ControlManagerState.State.MajorFault,
+    ):
+        print("⚠ 제어 매니저 fault 감지, 리셋 시도...")
+        if not robot.reset_fault_control_manager():
+            print("❌ fault 리셋 실패")
+            return
+
+    if not robot.enable_control_manager():
+        print("❌ 제어 매니저 활성화 실패")
+        return
+    print("✓ 제어 매니저 활성화")
+
+    # ===== 그리퍼 초기화 (UPC에서만) =====
+    gripper = None
+    if use_gripper:
+        try:
+            # 12V 출력 (그리퍼용)
+            for arm_name in ["right", "left"]:
+                robot.set_tool_flange_output_voltage(arm_name, 12)
+            time.sleep(0.5)
+
+            gripper = ReplayGripper()
+            if gripper.initialize():
+                gripper.homing()
+                gripper.start()
+            else:
+                print("⚠ 그리퍼 없이 진행")
+                gripper = None
+        except Exception as e:
+            print(f"⚠ 그리퍼 초기화 건너뜀: {e}")
+            gripper = None
+
+    # ===== action 벡터에서 관절/그리퍼 분리 =====
+    # 첫 프레임에서 action 크기 확인
+    first_frame = ds[episode_indices[0]]
+    action_tensor = first_frame["action"]
+    action_size = action_tensor.shape[0] if hasattr(action_tensor, "shape") else len(action_tensor)
+
+    if arms == "right":
+        n_arm_joints = 7
+        has_right_gripper = (action_size > 7)
+        has_left_gripper = False
+    elif arms == "left":
+        n_arm_joints = 7
+        has_right_gripper = False
+        has_left_gripper = (action_size > 7)
+    else:  # both
+        n_arm_joints = 14
+        has_right_gripper = (action_size > 14)
+        has_left_gripper = (action_size > 15) if has_right_gripper else (action_size > 14)
+
+    print(f"  action 크기: {action_size} (관절: {n_arm_joints}, "
+          f"R그리퍼: {'Y' if has_right_gripper else 'N'}, "
+          f"L그리퍼: {'Y' if has_left_gripper else 'N'})")
+
+    # ===== command stream 생성 =====
+    stream = robot.create_command_stream(10)
+    # ===== torso 초기 자세 (지정된 경우) =====
+    if torso_pose is not None:
+        print(f"torso 초기 자세로 이동 중... ({np.rad2deg(torso_pose).round(1)}°)")
+        _send_arm_command(stream, torso=torso_pose, minimum_time=5.0)
+        time.sleep(5.0)
+        print("✓ torso 이동 완료")
+    # ===== 첫 프레임으로 이동 (느리게) =====
+    first_action = first_frame["action"].numpy() if hasattr(first_frame["action"], "numpy") else np.array(first_frame["action"])
+    
+    if arms == "right":
+        right_arm_pos = first_action[0:7]
+        _send_arm_command(stream, right_arm=right_arm_pos, minimum_time=5.0)
+        # 그리퍼도 첫 프레임 값으로 초기화
+        if gripper and has_right_gripper:
+            gripper.set_target(np.array([first_action[7], 0.0]))
+    elif arms == "left":
+        left_arm_pos = first_action[0:7]
+        _send_arm_command(stream, left_arm=left_arm_pos, minimum_time=5.0)
+        if gripper and has_left_gripper:
+            gripper.set_target(np.array([0.0, first_action[7]]))
+    else:
+        right_arm_pos = first_action[0:7]
+        left_arm_pos = first_action[7:14]
+        _send_arm_command(stream, right_arm=right_arm_pos, left_arm=left_arm_pos, minimum_time=5.0)
+        if gripper:
+            r_grip = first_action[14] if has_right_gripper else 0.0
+            l_grip = first_action[15] if has_left_gripper else 0.0
+            gripper.set_target(np.array([r_grip, l_grip]))
+
+    print("초기 위치로 이동 중... (5초)")
+    time.sleep(5.0)
+
+    # ===== 재생 루프 =====
+    print(f"\n▶ 재생 시작! (Ctrl+C로 중단)")
+    stopped = False
+
+    def signal_handler(sig, frame):
+        nonlocal stopped
+        stopped = True
+        print("\n⏹ 중단 요청...")
+
+    old_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        for frame_idx, ds_idx in enumerate(episode_indices):
+            if stopped:
+                break
+
+            frame = ds[ds_idx]
+            action = frame["action"].numpy() if hasattr(frame["action"], "numpy") else np.array(frame["action"])
+
+            # 관절 명령 전송
+            frame_dt = dt / speed
+            if arms == "right":
+                right_arm_pos = action[0:7]
+                _send_arm_command(stream, right_arm=right_arm_pos, minimum_time=frame_dt)
+                # 그리퍼
+                if gripper and has_right_gripper:
+                    gripper.set_target(np.array([action[7], 0.0]))
+            elif arms == "left":
+                left_arm_pos = action[0:7]
+                _send_arm_command(stream, left_arm=left_arm_pos, minimum_time=frame_dt)
+                if gripper and has_left_gripper:
+                    gripper.set_target(np.array([0.0, action[7]]))
+            else:
+                right_arm_pos = action[0:7]
+                left_arm_pos = action[7:14]
+                _send_arm_command(stream, right_arm=right_arm_pos, left_arm=left_arm_pos, minimum_time=frame_dt)
+                if gripper:
+                    r_grip = action[14] if has_right_gripper else 0.0
+                    l_grip = action[15] if has_left_gripper else 0.0
+                    gripper.set_target(np.array([r_grip, l_grip]))
+
+            # 진행률 표시
+            if frame_idx % max(1, total_frames // 20) == 0 or frame_idx == total_frames - 1:
+                pct = (frame_idx + 1) / total_frames * 100
+                elapsed = (frame_idx + 1) * frame_dt
+                print(f"  [{pct:5.1f}%] 프레임 {frame_idx}/{total_frames-1} | {elapsed:.1f}s", end="\r")
+
+            time.sleep(frame_dt * 0.95)
+
+        print(f"\n✓ 재생 완료! ({total_frames}프레임)")
+
+    finally:
+        signal.signal(signal.SIGINT, old_handler)
+        # 정리
+        if gripper:
+            gripper.stop()
+            print("✓ 그리퍼 정지")
+        print("✓ 재생 종료")
+
+
+def _send_arm_command(stream, right_arm=None, left_arm=None, torso=None, minimum_time=0.1):
+    """팔/torso 관절 위치 명령 전송 (공식 SDK replay.py 참고)"""
+    body_builder = rby.BodyComponentBasedCommandBuilder()
+
+    if torso is not None:
+        body_builder.set_torso_command(
+            rby.JointPositionCommandBuilder()
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(1)
+            )
+            .set_minimum_time(minimum_time)
+            .set_position(torso)
+        )
+
+    if right_arm is not None:
+        body_builder.set_right_arm_command(
+            rby.JointPositionCommandBuilder()
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(1)
+            )
+            .set_minimum_time(minimum_time)
+            .set_position(right_arm)
+        )
+
+    if left_arm is not None:
+        body_builder.set_left_arm_command(
+            rby.JointPositionCommandBuilder()
+            .set_command_header(
+                rby.CommandHeaderBuilder().set_control_hold_time(1)
+            )
+            .set_minimum_time(minimum_time)
+            .set_position(left_arm)
+        )
+
+    rc = rby.RobotCommandBuilder().set_command(
+        rby.ComponentBasedCommandBuilder().set_body_command(body_builder)
+    )
+    stream.send_command(rc)
 
 
 if __name__ == "__main__":
