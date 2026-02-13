@@ -1,9 +1,40 @@
 #!/usr/bin/env python
-
 """
 RBY1 SDK LeRobot 형식 데이터 로깅
 
 현재 로봇 상태(조인트 + 그리퍼 + 카메라)를 LeRobot 데이터셋 형식으로 기록합니다.
+
+================================================================================
+[코드 구조 - 섹션 인덱스]
+================================================================================
+
+  섹션 1: Imports & 로깅 설정
+  섹션 2: 설정 상수 (에피소드, 조인트 이름, 카메라 매핑)
+  섹션 3: TeleopSettings 클래스         ★ 17_teleop 기반 + 확장 (마스터암 임계값)
+  섹션 4: READY_POSE & 마스터 암 상수   ★ 17_teleop 동일
+  섹션 5: Gripper 클래스               ★ 17_teleop 동일 (약간 래핑)
+  섹션 6: KeyboardController 클래스    ☆ 신규 (녹화 제어용)
+  섹션 7: RBY1Recorder 클래스 - __init__
+  섹션 8: RBY1Recorder - 로깅 유틸리티  ☆ 신규
+  섹션 9: RBY1Recorder - connect()     ★ 17_teleop 기반 + 확장 (EEF pose, 카메라)
+  섹션 10: RBY1Recorder - 시그널 핸들러  ★ 17_teleop 기반
+  섹션 11: RBY1Recorder - 웹 스트리밍   ☆ 신규
+  섹션 12: RBY1Recorder - 카메라 연결   ☆ 신규 (RealSense 멀티 카메라)
+  섹션 13: RBY1Recorder - _setup_teleop ★ 17_teleop 기반
+  섹션 14: RBY1Recorder - 자세 제어     ★ 17_teleop 기반
+  섹션 15: RBY1Recorder - 마스터 암 제어 루프  ★★ 17_teleop 핵심 (거의 동일)
+  섹션 16: RBY1Recorder - disconnect   ★ 17_teleop 종료 순서 동일
+  섹션 17: RBY1Recorder - get_observation  ☆ 신규 (LeRobot 형식)
+  섹션 18: RBY1Recorder - EEF pose 계산    ☆ 신규
+  섹션 19: RBY1Recorder - Feature 빌더     ☆ 신규 (LeRobot 형식)
+  섹션 20: RBY1Recorder - record_episodes  ☆ 신규 (메인 녹화 루프)
+  섹션 21: main() 함수                     ☆ 신규 (CLI)
+
+  ★ = 17_teleop 기반 (일부 수정)
+  ☆ = 신규 코드 (record 전용)
+  ★★ = 17_teleop 핵심 로직 (최소 수정)
+
+================================================================================
 
 === 두 가지 모드 ===
 
@@ -43,6 +74,10 @@ RBY1 SDK LeRobot 형식 데이터 로깅
     python record_rby1_standalone.py --address 192.168.30.1:50051 --teleop --episodes 5
 """
 
+# ============================================================================
+# 섹션 1: Imports & 로깅 설정
+# ============================================================================
+
 import argparse
 import logging
 import os
@@ -60,7 +95,7 @@ from typing import Optional
 
 import numpy as np
 
-# 로깅 설정 (17_teleop과 동일)
+# 로깅 설정 ★ 17_teleop과 동일
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -76,12 +111,12 @@ except ImportError:
     print("rby1-sdk를 먼저 빌드/설치하세요.")
     sys.exit(1)
 
-# LeRobot 데이터셋 사용
+# LeRobot 데이터셋 사용 ☆ 신규
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 # ============================================================================
-# 설정
+# 섹션 2: 설정 상수 ☆ 신규 (record 전용 설정)
 # ============================================================================
 
 # 에피소드당 최대 시간 (초) - 5분
@@ -105,7 +140,7 @@ WHEEL_JOINTS = [
 ]
 
 # ============================================================================
-# RealSense 카메라 시리얼 번호 ↔ 이름 매핑
+# 섹션 2-1: RealSense 카메라 시리얼 번호 ↔ 이름 매핑 ☆ 신규
 # 시리얼 번호는 재부팅해도 변하지 않으므로 안정적인 매핑 가능
 # ============================================================================
 CAMERA_SERIAL_MAP = {
@@ -123,9 +158,16 @@ CAMERA_MODEL_MAP = {
 
 
 # ============================================================================
-# 텔레오퍼레이션 설정 (SDK에서 가져옴)
+# 섹션 3: TeleopSettings 클래스 ★ 17_teleop 기반 + 안전 모니터링 확장
 # 참조: rby1-sdk/examples/python/17_teleoperation_with_joint_mapping.py
 # ============================================================================
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 17_teleop 원본 (class Settings):                                       │
+# │   master_arm_loop_period = 1 / 100                                     │
+# │   impedance_stiffness = 50                                             │
+# │   impedance_damping_ratio = 1.0                                        │
+# │   impedance_torque_limit = 30.0                                        │
+# └─────────────────────────────────────────────────────────────────────────┘
 
 class TeleopSettings:
     """텔레오퍼레이션 설정
@@ -168,8 +210,18 @@ class TeleopSettings:
     torque_critical = 50.0
 
 # ============================================================================
-# 초기 자세 설정
+# 섹션 4: READY_POSE & 초기 자세 설정 ★ 17_teleop 기반 (torso만 커스텀)
 # ============================================================================
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 17_teleop 원본 (READY_POSE):                                           │
+# │   READY_POSE = {                                                        │
+# │     "A": Pose(                                                          │
+# │       toros=np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),            │
+# │       right_arm=np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),  │
+# │       left_arm=np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),    │
+# │     ), ...                                                              │
+# │   }                                                                     │
+# └─────────────────────────────────────────────────────────────────────────┘
 # 17_teleop 기본값 (Ready pose):
 #   torso:     [0.0, 45.0, -90.0, 45.0, 0.0, 0.0] deg
 #   right_arm: [0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0] deg
@@ -201,9 +253,17 @@ READY_POSE = {
 }
 
 # ============================================================================
-# 마스터 암 관절 제한 (17_teleop 기본값과 동일)
+# 섹션 4-1: 마스터 암 관절 제한 ★★ 17_teleop 완전 동일
 # ============================================================================
-MA_Q_LIMIT_BARRIER = 0.5  # (17_teleop 기본값: 0.5)
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 17_teleop 원본:                                                         │
+# │   ma_q_limit_barrier = 0.5                                             │
+# │   ma_min_q = np.deg2rad([-360,-30,0,-135,-90,35,-360,...])            │
+# │   ma_max_q = np.deg2rad([360,-10,90,-60,90,80,360,...])               │
+# │   ma_torque_limit = np.array([3.5,3.5,3.5,1.5,1.5,1.5,1.5] * 2)       │
+# │   ma_viscous_gain = np.array([0.02,0.02,0.02,0.02,0.01,0.01,0.002]*2) │
+# └─────────────────────────────────────────────────────────────────────────┘
+MA_Q_LIMIT_BARRIER = 0.5  # ★ 17_teleop 동일
 # 마스터 암 관절 각도 제한 [오른팔 7 + 왼팔 7]
 MA_MIN_Q = np.deg2rad([-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360])  # 17_teleop 기본값
 MA_MAX_Q = np.deg2rad([360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360])           # 17_teleop 기본값
@@ -212,14 +272,29 @@ MA_TORQUE_LIMIT = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)  # 17_teleop
 # 마스터 암 점성 게인 (관절별 damping)
 MA_VISCOUS_GAIN = np.array([0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2)  # 17_teleop 기본값
 
-# 그리퍼 방향 설정 (17_teleop 기본값: False = 반전)
-# True: 정방향 (trigger 증가 → 그리퍼 닫힘)
-# False: 반전 (trigger 증가 → 그리퍼 열림)
+# 그리퍼 방향 설정 ★ 17_teleop 동일 (GRIPPER_DIRECTION = False)
 GRIPPER_DIRECTION = False
 
 
+# ============================================================================
+# 섹션 5: Gripper 클래스 ★ 17_teleop 동일 (lazy init으로 래핑)
+# ============================================================================
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ 17_teleop 원본 (class Gripper):                                        │
+# │   - __init__: bus 즉시 초기화                                          │
+# │   - initialize: ping 테스트                                            │
+# │   - set_operating_mode: 토크 끄고 모드 변경 후 다시 켬                  │
+# │   - homing: CurrentControlMode로 min/max 탐색                          │
+# │   - start/stop/loop: 스레드로 target_q 전송                           │
+# │   - set_target: normalized_q → actual position                        │
+# │                                                                         │
+# │ 변경점:                                                                 │
+# │   - __init__에서 bus=None (lazy init, initialize()에서 생성)           │
+# │   - 예외 처리 추가                                                      │
+# └─────────────────────────────────────────────────────────────────────────┘
+
 class Gripper:
-    """그리퍼 제어 클래스 (SDK에서 가져옴)"""
+    """그리퍼 제어 클래스 ★ 17_teleop 기반"""
     
     def __init__(self):
         self.bus = None
@@ -325,7 +400,7 @@ class Gripper:
     def _control_loop(self):
         """그리퍼 제어 루프 (99_teleoperation과 동일)"""
         self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
-        self.bus.group_sync_write_send_torque([(dev_id, 5) for dev_id in [0, 1]])
+        self.bus.group_sync_write_send_torque([(dev_id, 0.5) for dev_id in [0, 1]])
         while self._running:
             if self.bus and self.target_q is not None:
                 try:
@@ -334,11 +409,15 @@ class Gripper:
                     )
                 except Exception:
                     pass
-            time.sleep(0.1)  # 10Hz (99_teleoperation과 동일)
+            time.sleep(0.1)  # 10Hz ★ 17_teleop 동일
 
+
+# ============================================================================
+# 섹션 6: KeyboardController 클래스 ☆ 신규 (녹화 제어용)
+# ============================================================================
 
 class KeyboardController:
-    """비차단 키보드 입력 처리"""
+    """비차단 키보드 입력 처리 ☆ 신규"""
 
     def __init__(self):
         self.fd = sys.stdin.fileno()
@@ -360,12 +439,16 @@ class KeyboardController:
         return None
 
 
+# ============================================================================
+# 섹션 7: RBY1Recorder 클래스 - __init__ ☆ 신규
+# ============================================================================
+
 class RBY1Recorder:
-    """RBY1 SDK를 사용한 LeRobot 형식 데이터 레코더"""
+    """RBY1 SDK를 사용한 LeRobot 형식 데이터 레코더 ☆ 신규"""
 
     def __init__(self, address: str, model: str = "a", camera_id: Optional[int] = None, 
                  arms: str = "both", use_realsense: bool = False, use_teleop: bool = False,
-                 camera_names: Optional[list] = None, stream_port: int = 0,
+                 camera_names: Optional[list] = None, stream_port: int = 8000,
                  control_mode: str = "impedance", reset_pose: bool = True,
                  use_wheels: bool = False):
         self.address = address
@@ -417,6 +500,7 @@ class RBY1Recorder:
         self.robot_max_qddot = None
         self.right_minimum_time = 1.0
         self.left_minimum_time = 1.0
+        self._master_arm_paused = False  # 마스터 암 루프 일시 정지 플래그
         
         # 헤드 제어 관련
         self.head_q = np.array([0.0, 0.0])  # [pan (head_0), tilt (head_1)]
@@ -508,16 +592,28 @@ class RBY1Recorder:
         
         return joints
 
+    # ========================================================================
+    # 섹션 7-1: _state_callback ★ 17_teleop 기반 (robot_q 저장 추가)
+    # ========================================================================
+    # 17_teleop 원본:
+    #   def robot_state_callback(state: rby.RobotState_A):
+    #       nonlocal robot_q
+    #       robot_q = state.position
+    # ========================================================================
     def _state_callback(self, robot_state, control_manager_state=None):
-        """로봇 상태 업데이트 콜백"""
+        """로봇 상태 업데이트 콜백 ★ 17_teleop 기반"""
         with self.state_lock:
             self.latest_state = robot_state
-            # 텔레오퍼레이션용 로봇 관절 위치 업데이트
+            # ★ 17_teleop 동일: 텔레오퍼레이션용 로봇 관절 위치 업데이트
             if robot_state is not None:
                 self.robot_q = np.array(robot_state.position)
 
+    # ========================================================================
+    # 섹션 8: 로깅 유틸리티 ☆ 신규 (디버깅용 로그 기록)
+    # ========================================================================
+    
     def _setup_log_folder(self):
-        """로그 폴더 및 파일 설정 (시간 기반 폴더명)"""
+        """로그 폴더 및 파일 설정 ☆ 신규"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_base = Path.home() / "vla_ws" / "logs"
         self._log_dir = log_base / f"teleop_{timestamp}"
@@ -678,8 +774,25 @@ class RBY1Recorder:
         except Exception as e:
             self._write_safety_log("CRITICAL", f"마스터암 해제 오류: {e}")
 
+    # ========================================================================
+    # 섹션 9: connect() ★ 17_teleop 기반 + 카메라/스트리밍 확장
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본 main() 함수 초반부:                                  │
+    # │   robot = rby.create_robot(address, model)                         │
+    # │   robot.connect()                                                   │
+    # │   robot.is_power_on() / power_on()                                 │
+    # │   robot.is_servo_on() / servo_on()                                 │
+    # │   robot.reset_fault_control_manager()                              │
+    # │   robot.enable_control_manager()                                   │
+    # │   robot.set_tool_flange_output_voltage(arm, 12)                    │
+    # │   robot.set_parameter("joint_position_command.cutoff_frequency","3")│
+    # │   move_j(robot, READY_POSE[model], 5)                              │
+    # │   robot.start_state_update(callback, rate)                         │
+    # └─────────────────────────────────────────────────────────────────────┘
+    
     def connect(self):
-        """로봇 및 카메라, 마스터 암 연결"""
+        """로봇 및 카메라, 마스터 암 연결 ★ 17_teleop 기반"""
         print(f"로봇 연결 중: {self.address}")
         self.robot = rby.create_robot(self.address, self.model)
         self.robot.connect()
@@ -779,8 +892,23 @@ class RBY1Recorder:
         self._register_signal_handlers()
         print("✓ 시그널 핸들러 등록 완료 (Ctrl+C로 안전 종료)")
 
+    # ========================================================================
+    # 섹션 10: 시그널 핸들러 ★ 17_teleop 기반 (handler 함수 확장)
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본 (def handler):                                      │
+    # │   robot.stop_state_update()                                         │
+    # │   master_arm.stop_control()                                         │
+    # │   robot.cancel_control()                                            │
+    # │   time.sleep(0.5)                                                   │
+    # │   robot.disable_control_manager()                                   │
+    # │   robot.power_off("12v")                                           │
+    # │   gripper.stop()                                                    │
+    # │   exit(1)                                                           │
+    # └─────────────────────────────────────────────────────────────────────┘
+    
     def _register_signal_handlers(self):
-        """시그널 핸들러 등록 (SIGINT, SIGTERM)"""
+        """시그널 핸들러 등록 ★ 17_teleop 기반"""
         self._original_sigint_handler = signal.getsignal(signal.SIGINT)
         self._original_sigterm_handler = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -902,22 +1030,22 @@ class RBY1Recorder:
                 state = self.latest_state
                 # joint_states에서 온도, 전류, 토크 읽기
                 if hasattr(state, 'temperature') and state.temperature is not None and len(state.temperature) > 0:
-                    status["robot"]["temperature"] = [float(x) for x in state.temperature]
+                    status["robot"]["temperature"] = list(state.temperature)
                 if hasattr(state, 'current') and state.current is not None and len(state.current) > 0:
-                    status["robot"]["current"] = [float(x) for x in state.current]
+                    status["robot"]["current"] = list(state.current)
                 if hasattr(state, 'torque') and state.torque is not None and len(state.torque) > 0:
-                    status["robot"]["torque"] = [float(x) for x in state.torque]
+                    status["robot"]["torque"] = list(state.torque)
                 if hasattr(state, 'position') and state.position is not None and len(state.position) > 0:
-                    status["robot"]["joints"] = [float(x) for x in state.position]
+                    status["robot"]["joints"] = list(state.position)
         
         # 마스터 암 상태
         with self.master_arm_lock:
             if self.master_arm_state is not None:
                 ma_state = self.master_arm_state
                 if hasattr(ma_state, 'q_joint'):
-                    status["master_arm"]["q_joint"] = [float(x) for x in ma_state.q_joint]
+                    status["master_arm"]["q_joint"] = list(ma_state.q_joint)
                 if hasattr(ma_state, 'torque_joint'):
-                    status["master_arm"]["torque_joint"] = [float(x) for x in ma_state.torque_joint]
+                    status["master_arm"]["torque_joint"] = list(ma_state.torque_joint)
                 if hasattr(ma_state, 'button_right'):
                     status["master_arm"]["button_right"] = bool(ma_state.button_right.button)
                     status["master_arm"]["trigger_right"] = int(ma_state.button_right.trigger)
@@ -928,16 +1056,20 @@ class RBY1Recorder:
         # 그리퍼 상태
         if self.gripper is not None:
             if self.gripper.target_q is not None:
-                status["gripper"]["target_q"] = [float(x) for x in self.gripper.target_q]
+                status["gripper"]["target_q"] = list(self.gripper.target_q)
             if np.isfinite(self.gripper.min_q).all():
-                status["gripper"]["min_q"] = [float(x) for x in self.gripper.min_q]
+                status["gripper"]["min_q"] = list(self.gripper.min_q)
             if np.isfinite(self.gripper.max_q).all():
-                status["gripper"]["max_q"] = [float(x) for x in self.gripper.max_q]
+                status["gripper"]["max_q"] = list(self.gripper.max_q)
         
         return status
 
+    # ========================================================================
+    # 섹션 11: 웹 스트리밍 서버 ☆ 신규
+    # ========================================================================
+    
     def _start_stream_server(self):
-        """웹 스트리밍 서버 시작 (MJPEG 멀티스레드 + 모터 모니터링)"""
+        """웹 스트리밍 서버 시작 ☆ 신규"""
         recorder = self
         from socketserver import ThreadingMixIn
         import cv2
@@ -1054,8 +1186,12 @@ class RBY1Recorder:
         
         print(f"🌐 카메라 스트리밍: http://localhost:{self.stream_port}")
 
+    # ========================================================================
+    # 섹션 12: 카메라 연결 ☆ 신규 (RealSense 멀티 카메라 지원)
+    # ========================================================================
+    
     def _connect_camera(self):
-        """카메라 연결 (멀티 RealSense - 시리얼 번호 기반 동적 매핑)"""
+        """카메라 연결 ☆ 신규"""
         # RealSense 카메라 시도 (멀티 카메라 지원)
         if self.use_realsense:
             try:
@@ -1145,8 +1281,28 @@ class RBY1Recorder:
                 print("⚠ OpenCV 없음, 카메라 비활성화")
                 self.camera = None
 
+    # ========================================================================
+    # 섹션 13: _setup_teleop ★ 17_teleop 기반 (그리퍼+마스터암 초기화)
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본:                                                     │
+    # │   # ===== SETUP GRIPPER =====                                       │
+    # │   gripper = Gripper()                                               │
+    # │   gripper.initialize()  # 실패시 exit(1)                           │
+    # │   gripper.homing()                                                  │
+    # │   gripper.start()                                                   │
+    # │                                                                     │
+    # │   # ===== SETUP MASTER ARM =====                                    │
+    # │   rby.upc.initialize_device(rby.upc.MasterArmDeviceName)           │
+    # │   master_arm = rby.upc.MasterArm(rby.upc.MasterArmDeviceName)      │
+    # │   master_arm.set_model_path(master_arm_model)                       │
+    # │   master_arm.set_control_period(Settings.master_arm_loop_period)   │
+    # │   active_ids = master_arm.initialize(verbose=False)                │
+    # │   master_arm.start_control(master_arm_control_loop)                │
+    # └─────────────────────────────────────────────────────────────────────┘
+    
     def _setup_teleop(self):
-        """완전한 텔레오퍼레이션 설정 (마스터 암 + 그리퍼 + 로봇 제어)"""
+        """텔레오퍼레이션 설정 ★ 17_teleop 기반"""
         try:
             model_name = self.robot_model.model_name if self.robot_model else "A"
             
@@ -1165,17 +1321,21 @@ class RBY1Recorder:
                 print("✓ Position 모드 활성화")
             
             # ========================================================================
-            # ⚠️ 안전: 초기 자세로 이동 (17_teleop의 move_j처럼 블로킹, Position 모드)
+            # ⚠️ 안전: 초기 자세로 이동 (17_teleop의 move_j처럼 블로킹)
             # 로봇이 이동 중에 마스터 암 제어가 시작되면 충돌 위험!
             # ========================================================================
             print("초기 자세로 이동 중...")
             ready_pose = READY_POSE.get(model_name, READY_POSE["A"])
+            self._send_ready_pose_stream(ready_pose, minimum_time=5.0)
             
-            # 공식 17_teleop처럼 blocking으로 이동 (Position 모드)
-            if not self._move_j(ready_pose, minimum_time=5.0):
+            # 초기 자세 도달까지 폴링 대기
+            pose_reached = self._wait_for_pose_reached(ready_pose, tolerance=0.1, timeout=10.0)
+            if not pose_reached:
+                # 사용자에게 경고하고 확인 요청
                 print("\n" + "=" * 60)
-                print("⚠️  경고: 초기 자세 이동 실패!")
-                print("   SDK에서 FinishCode.Ok를 반환하지 않았습니다.")
+                print("⚠️  경고: 초기 자세 도달 타임아웃!")
+                print("   로봇이 예상 위치에 도달하지 못했습니다.")
+                print("   현재 위치에서 시작하면 마스터 암과 동기화되지 않을 수 있습니다.")
                 print("=" * 60)
                 # 3초 대기 (사용자가 상황 인지하도록)
                 for i in range(3, 0, -1):
@@ -1284,49 +1444,22 @@ class RBY1Recorder:
                 pass
             self.command_stream = None
     
-    def _move_j(self, pose: dict, minimum_time: float = 5.0) -> bool:
-        """초기 자세로 이동 (공식 17_teleop의 move_j와 동일)
-        
-        블로킹 호출, Position 모드 사용 (Impedance 설정과 무관)
-        SDK의 handler.get()이 완료될 때까지 대기
-        """
-        # Position 모드 빌더 (17_teleop 기본값)
-        torso_builder = (
-            rby.JointPositionCommandBuilder()
-            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
-            .set_position(pose["torso"])
-            .set_minimum_time(minimum_time)
-        )
-        
-        right_arm_builder = (
-            rby.JointPositionCommandBuilder()
-            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
-            .set_position(pose["right_arm"])
-            .set_minimum_time(minimum_time)
-        )
-        
-        left_arm_builder = (
-            rby.JointPositionCommandBuilder()
-            .set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(0))
-            .set_position(pose["left_arm"])
-            .set_minimum_time(minimum_time)
-        )
-        
-        cmd = rby.RobotCommandBuilder().set_command(
-            rby.ComponentBasedCommandBuilder().set_body_command(
-                rby.BodyComponentBasedCommandBuilder()
-                .set_torso_command(torso_builder)
-                .set_right_arm_command(right_arm_builder)
-                .set_left_arm_command(left_arm_builder)
-            )
-        )
-        
-        handler = self.robot.send_command(cmd)
-        result = handler.get()
-        return result == rby.RobotCommandFeedback.FinishCode.Ok
-
+    # ========================================================================
+    # 섹션 14: 자세 제어 ★ 17_teleop 기반 (joint_position_command_builder)
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본 (def joint_position_command_builder):               │
+    # │   right_arm_builder = rby.JointPositionCommandBuilder() ...         │
+    # │   left_arm_builder = rby.JointPositionCommandBuilder() ...          │
+    # │   return rby.RobotCommandBuilder().set_command(...)                │
+    # │                                                                     │
+    # │ 17_teleop 원본 (def move_j):                                        │
+    # │   handler = robot.send_command(joint_position_command_builder(...))│
+    # │   return handler.get() == rby.RobotCommandFeedback.FinishCode.Ok  │
+    # └─────────────────────────────────────────────────────────────────────┘
+    
     def _send_ready_pose_stream(self, pose: dict, minimum_time: float = 5.0):
-        """초기 자세로 이동 (command_stream 사용, 비블로킹)"""
+        """초기 자세로 이동 ★ 17_teleop 기반"""
         if self.command_stream is None:
             return
         
@@ -1444,9 +1577,15 @@ class RBY1Recorder:
         
         print("\n🔄 초기 자세로 이동 중...")
         
-        # 공식 17_teleop처럼 blocking으로 이동 (Position 모드)
-        if not self._move_j(ready_pose, minimum_time=2.0):
-            print("   ⚠ 이동 실패 - 현재 위치에서 진행")
+        # 마스터 암 루프 일시 정지 (command_stream 충돌 방지)
+        self._master_arm_paused = True
+        time.sleep(0.05)  # 진행 중인 루프 사이클 완료 대기
+        
+        self._send_ready_pose_stream(ready_pose, minimum_time=5.0)
+        
+        # 스마트 대기: 목표 도달시 즉시 진행
+        if not self._wait_for_pose_reached(ready_pose, tolerance=0.1, timeout=timeout):
+            print("   ⚠ 타임아웃 - 현재 위치에서 진행")
         
         # 마스터 암 목표 위치도 초기화
         if self.master_arm is not None:
@@ -1454,6 +1593,9 @@ class RBY1Recorder:
             self.left_q = ready_pose["left_arm"].copy()
             self.right_minimum_time = 1.0
             self.left_minimum_time = 1.0
+        
+        # 마스터 암 루프 재개
+        self._master_arm_paused = False
         
         print("✓ 초기 자세 완료")
     
@@ -1528,12 +1670,48 @@ class RBY1Recorder:
             print(f"⚠ 초기 자세 이동 오류: {e}")
             return False
     
-    # _check_safety_limits 제거됨 - 17_teleop과 동일하게 별도 안전 모니터링 없이 동작
-    # 마스터 암 상태에는 temperature/current/torque 필드가 없음
-    # 로봇 본체는 RBY1 SDK 내부에서 자체 안전 관리됨
+    # ========================================================================
+    # 섹션 15: 마스터 암 제어 루프 ★★ 17_teleop 핵심 (거의 동일)
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본 (def master_arm_control_loop):                       │
+    # │                                                                     │
+    # │   # 1. 초기 목표 위치 설정                                          │
+    # │   if right_q is None: right_q = state.q_joint[0:7]                 │
+    # │   if left_q is None: left_q = state.q_joint[7:14]                  │
+    # │                                                                     │
+    # │   # 2. 그리퍼 제어                                                  │
+    # │   gripper.set_target(np.array([...trigger/1000...]))               │
+    # │                                                                     │
+    # │   # 3. 마스터 암 토크 계산 ← ★ 핵심 공식                            │
+    # │   torque = (gravity_term                                            │
+    # │            + ma_q_limit_barrier * (max(min_q - q, 0) + min(...))   │
+    # │            + ma_viscous_gain * qvel_joint)                         │
+    # │   torque = np.clip(torque, -ma_torque_limit, ma_torque_limit)      │
+    # │                                                                     │
+    # │   # 4. 버튼 상태에 따른 마스터 암 모드 설정                         │
+    # │   if button == 1: CurrentControlMode, torque * 0.6                 │
+    # │   else: CurrentBasedPositionControlMode, target_position           │
+    # │                                                                     │
+    # │   # 5. 충돌 체크                                                    │
+    # │   dyn_state.set_q(q)                                               │
+    # │   dyn_model.compute_forward_kinematics(dyn_state)                  │
+    # │   is_collision = detect_collisions...distance < 0.02              │
+    # │                                                                     │
+    # │   # 6. 로봇 명령 빌드 (버튼 눌렀을 때만)                            │
+    # │   if button and not is_collision:                                   │
+    # │       minimum_time -= loop_period                                   │
+    # │       builder.set_position(clip(q)).set_velocity_limit(...)        │
+    # │       rc.set_right/left_arm_command(builder)                       │
+    # │                                                                     │
+    # │   # 7. 명령 전송                                                    │
+    # │   stream.send_command(...)                                          │
+    # │                                                                     │
+    # │   return ma_input                                                   │
+    # └─────────────────────────────────────────────────────────────────────┘
     
     def _master_arm_control_loop(self, state):
-        """마스터 암 제어 콜백 - 로봇을 실시간으로 제어
+        """마스터 암 제어 콜백 ★★ 17_teleop 핵심
 
         
         Note: 이 콜백은 100Hz로 호출되므로 예외 발생 시 안전하게 처리해야 함
@@ -1547,7 +1725,7 @@ class RBY1Recorder:
             return rby.upc.MasterArm.ControlInput()
     
     def _master_arm_control_loop_inner(self, state):
-        """마스터 암 제어 콜백 내부 구현
+        """마스터 암 제어 콜백 내부 구현 ★★ 17_teleop 핵심
         
         Args:
             state: 마스터 암 상태 (rby.upc.MasterArm.State)
@@ -1555,6 +1733,18 @@ class RBY1Recorder:
                    - qvel_joint: 마스터 암 관절 속도
                    - button_right/left: 버튼 상태
                    - gravity_term: 중력 보상 토크
+        
+        ★★ 17_teleop과 동일한 부분:
+            - 토크 계산 공식 (gravity + barrier + viscous)
+            - 버튼 상태에 따른 operating_mode 설정
+            - 충돌 체크 로직
+            - minimum_time 감소 로직
+            - 로봇 명령 빌더 구조
+        
+        ☆ 추가된 부분:
+            - master_arm_lock으로 상태 저장 (녹화용)
+            - 토크 모니터링 (안전 기능)
+            - 텔레옵 로그 기록
         """
         # 현재 마스터 암 상태 저장 (녹화용)
         with self.master_arm_lock:
@@ -1600,10 +1790,12 @@ class RBY1Recorder:
         if self._teleop_paused:
             return rby.upc.MasterArm.ControlInput()
         
-        # 로그 파일에 저장 (17_teleop과 동일: 매초 버튼/트리거 상태)
+        # 로그 파일에 저장 + 콘솔 출력 (17_teleop과 동일: 매초 버튼/트리거 상태)
         self._ma_log_count += 1
         if self._ma_log_count % round(1 / TeleopSettings.master_arm_loop_period) == 0:
             self._write_teleop_log(state)
+            # ★ 17_teleop 동일: 콘솔에 버튼 상태 출력
+            print(f"Button: R={state.button_right.button}, L={state.button_left.button} | Trigger: R={state.button_right.trigger:.0f}, L={state.button_left.trigger:.0f}")
             self._ma_log_count = 0
         
         # 로봇 관절 위치가 없으면 대기
@@ -1628,7 +1820,10 @@ class RBY1Recorder:
                 state.button_left.trigger / 1000.0
             ]))
         
-        # 마스터 암 토크 계산
+        # ★★ 17_teleop 핵심 공식: 마스터 암 토크 계산
+        # gravity_term: 중력 보상
+        # barrier term: 관절 제한 근처에서 반발력
+        # viscous term: 속도 비례 감쇠
         torque = (
             state.gravity_term
             + MA_Q_LIMIT_BARRIER * (
@@ -1639,27 +1834,29 @@ class RBY1Recorder:
         )
         torque = np.clip(torque, -MA_TORQUE_LIMIT, MA_TORQUE_LIMIT)
         
-        # 오른팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
+        # ★★ 17_teleop 동일: 오른팔 마스터 암 제어
+        # 버튼 누름 = CurrentControlMode (자유 이동, 토크 * 0.6)
+        # 버튼 안 누름 = CurrentBasedPositionControlMode (위치 유지)
         if state.button_right.button == 1:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[0:7] = torque[0:7] * 0.4  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[0:7] = torque[0:7] * 0.4  # ★ 17_teleop 동일: 0.6
             self.right_q = np.array(state.q_joint[0:7])
         else:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
             ma_input.target_torque[0:7] = MA_TORQUE_LIMIT[0:7]
             ma_input.target_position[0:7] = self.right_q
         
-        # 왼팔 마스터 암 제어 (토크 게인 0.6 - 17_teleop 기본값과 동일)
+        # ★★ 17_teleop 동일: 왼팔 마스터 암 제어
         if state.button_left.button == 1:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[7:14] = torque[7:14] * 0.4  # 17_teleop 기본값: 0.6
+            ma_input.target_torque[7:14] = torque[7:14] * 0.4  # ★ 17_teleop 동일: 0.6
             self.left_q = np.array(state.q_joint[7:14])
         else:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
             ma_input.target_torque[7:14] = MA_TORQUE_LIMIT[7:14]
             ma_input.target_position[7:14] = self.left_q
         
-        # 충돌 체크
+        # ★★ 17_teleop 동일: 충돌 체크
         q = self.robot_q.copy()
         q[self.robot_model.right_arm_idx] = self.right_q
         q[self.robot_model.left_arm_idx] = self.left_q
@@ -1667,10 +1864,12 @@ class RBY1Recorder:
         self.dyn_robot.compute_forward_kinematics(self.dyn_state)
         is_collision = self.dyn_robot.detect_collisions_or_nearest_links(self.dyn_state, 1)[0].distance < 0.02
         
-        # 로봇 명령 빌드
+        # ★★ 17_teleop 동일: 로봇 명령 빌드
         rc = rby.BodyComponentBasedCommandBuilder()
         
+        # ★★ 17_teleop 동일: 오른팔 - 버튼 눌렸고 충돌 아닐 때만 명령 전송
         if state.button_right.button and not is_collision:
+            # ★ minimum_time 감소 로직 (17_teleop 동일)
             self.right_minimum_time -= TeleopSettings.master_arm_loop_period
             self.right_minimum_time = max(self.right_minimum_time, TeleopSettings.master_arm_loop_period * 1.01)
             
@@ -1732,16 +1931,15 @@ class RBY1Recorder:
         else:
             self.left_minimum_time = 0.8
         
-        # 로봇에 명령 전송 (body만 - 마스터 암 버튼 눌렀을 때만)
-        if self.command_stream:
+        # ★★ 17_teleop 동일: 항상 명령 전송 (버튼 상태와 무관)
+        # 단, ready pose 이동 중에는 명령 전송 중지
+        if self.command_stream and not self._master_arm_paused:
             try:
-                has_arm_command = state.button_right.button or state.button_left.button
-                
-                if has_arm_command:
-                    cmd_builder = rby.ComponentBasedCommandBuilder().set_body_command(rc)
-                    self.command_stream.send_command(
-                        rby.RobotCommandBuilder().set_command(cmd_builder)
+                self.command_stream.send_command(
+                    rby.RobotCommandBuilder().set_command(
+                        rby.ComponentBasedCommandBuilder().set_body_command(rc)
                     )
+                )
             except RuntimeError as e:
                 # command_stream 만료시 재생성
                 if "expired" in str(e):
@@ -1794,18 +1992,23 @@ class RBY1Recorder:
         
         return action
 
+    # ========================================================================
+    # 섹션 16: disconnect ★ 17_teleop 종료 순서 동일
+    # ========================================================================
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ 17_teleop 원본 (def handler - 종료 순서):                         │
+    # │   1. robot.stop_state_update()     ← 상태 콜백 먼저 중지          │
+    # │   2. master_arm.stop_control()                                      │
+    # │   3. robot.cancel_control()                                         │
+    # │   4. time.sleep(0.5)               ← 명령 완료 대기               │
+    # │   5. robot.disable_control_manager()                                │
+    # │   6. robot.power_off("12v")                                        │
+    # │   7. gripper.stop()                 ← 그리퍼는 마지막!               │
+    # │   exit(1)                                                           │
+    # └─────────────────────────────────────────────────────────────────────┘
+    
     def disconnect(self):
-        """연결 해제
-        
-        종료 순서 (공식 17_teleoperation_with_joint_mapping.py 기준):
-          1. stop_state_update   ← 상태 콜백 먼저 중지
-          2. master_arm.stop_control()
-          3. cancel_control
-          4. sleep(0.5)          ← 명령 완료 대기
-          5. disable_control_manager
-          6. power_off
-          7. gripper.stop()      ← 그리퍼는 마지막
-        """
+        """연결 해제 ★ 17_teleop 종료 순서 동일"""
         # 중복 호출 방지
         if hasattr(self, '_disconnected') and self._disconnected:
             return
@@ -1820,9 +2023,9 @@ class RBY1Recorder:
             print(f"✓ 로그 저장 완료: {self._log_dir}")
             self._log_dir = None  # 중복 출력 방지
         
-        # === 공식 순서 적용 ===
+        # === ★ 17_teleop 공식 순서 적용 ===
         
-        # 1. 상태 업데이트 중지 (중복 호출 방지) ← 먼저!
+        # ★ 1. 상태 업데이트 중지 (중복 호출 방지) ← 먼저!
         if self.robot and not self._state_update_stopped:
             try:
                 self.robot.stop_state_update()
@@ -1884,8 +2087,53 @@ class RBY1Recorder:
             self.camera.release()
             print("✓ 카메라 연결 해제")
 
+    # ========================================================================
+    # 섹션 16.5: 그리퍼 관측 헬퍼 ☆ 신규
+    # ========================================================================
+
+    def _get_gripper_normalized_pos(self) -> tuple[float, float]:
+        """Dynamixel 그리퍼 현재 위치를 0-1 정규화하여 반환.
+        
+        action의 gripper 값(trigger/1000 → 0-1)과 동일한 스케일로
+        observation의 gripper 값도 맞추기 위해, Dynamixel 엔코더를
+        min_q/max_q 기준으로 정규화한다.
+        
+        Returns:
+            (right_gripper_pos, left_gripper_pos) — 각각 0-1 범위
+        """
+        if self.gripper is None or self.gripper.bus is None:
+            return 0.0, 0.0
+        if not np.isfinite(self.gripper.min_q).all() or not np.isfinite(self.gripper.max_q).all():
+            return 0.0, 0.0
+
+        try:
+            rv = self.gripper.bus.group_fast_sync_read_encoder([0, 1])
+            if rv is None:
+                return 0.0, 0.0
+
+            q = np.array([0.0, 0.0])
+            for dev_id, enc in rv:
+                q[dev_id] = enc
+
+            # set_target 의 역변환: encoder → 0-1
+            range_q = self.gripper.max_q - self.gripper.min_q
+            safe_range = np.where(range_q != 0, range_q, 1.0)
+            if GRIPPER_DIRECTION:
+                normalized = (q - self.gripper.min_q) / safe_range
+            else:
+                normalized = 1.0 - (q - self.gripper.min_q) / safe_range
+
+            normalized = np.clip(normalized, 0.0, 1.0)
+            return float(normalized[0]), float(normalized[1])  # [0]=right, [1]=left
+        except Exception:
+            return 0.0, 0.0
+
+    # ========================================================================
+    # 섹션 17: get_observation ☆ 신규 (LeRobot 형식 데이터 수집)
+    # ========================================================================
+    
     def get_observation(self) -> dict:
-        """현재 관측 데이터 수집"""
+        """현재 관측 데이터 수집 ☆ 신규"""
         obs = {}
 
         # 로봇 상태
@@ -1938,34 +2186,14 @@ class RBY1Recorder:
                         obs[f"{wheel_name}.vel"] = 0.0
                         obs[f"{wheel_name}.torque"] = 0.0
 
-            # 그리퍼 상태 (tool_state에서 가져오기)
-            try:
-                if hasattr(state, 'tool_state') and state.tool_state is not None:
-                    tool = state.tool_state
-                    if self.arms in ["right", "both"]:
-                        if hasattr(tool, 'right_gripper_position'):
-                            obs["right_gripper.pos"] = float(tool.right_gripper_position)
-                        elif hasattr(tool, 'right_tool_position'):
-                            obs["right_gripper.pos"] = float(tool.right_tool_position)
-                        else:
-                            obs["right_gripper.pos"] = 0.0
-                    if self.arms in ["left", "both"]:
-                        if hasattr(tool, 'left_gripper_position'):
-                            obs["left_gripper.pos"] = float(tool.left_gripper_position)
-                        elif hasattr(tool, 'left_tool_position'):
-                            obs["left_gripper.pos"] = float(tool.left_tool_position)
-                        else:
-                            obs["left_gripper.pos"] = 0.0
-                else:
-                    if self.arms in ["right", "both"]:
-                        obs["right_gripper.pos"] = 0.0
-                    if self.arms in ["left", "both"]:
-                        obs["left_gripper.pos"] = 0.0
-            except Exception:
-                if self.arms in ["right", "both"]:
-                    obs["right_gripper.pos"] = 0.0
-                if self.arms in ["left", "both"]:
-                    obs["left_gripper.pos"] = 0.0
+            # 그리퍼 상태 (Dynamixel 엔코더에서 읽어 0-1 정규화)
+            # ★ 수정: tool_state는 Dynamixel 그리퍼를 반영하지 못해 항상 0이었음
+            #   → Dynamixel 엔코더를 직접 읽고, action과 동일한 0-1 스케일로 정규화
+            right_grip, left_grip = self._get_gripper_normalized_pos()
+            if self.arms in ["right", "both"]:
+                obs["right_gripper.pos"] = right_grip
+            if self.arms in ["left", "both"]:
+                obs["left_gripper.pos"] = left_grip
 
             # EEF pose 계산
             if self.dyn_robot is not None:
@@ -1976,31 +2204,23 @@ class RBY1Recorder:
 
         # 멀티 RealSense 카메라 이미지
         if self.rs_pipelines:
-            # 스트리밍 중이면 stream_frames에서 가져오기 (레이스 컨디션 방지)
-            if self.stream_port > 0 and hasattr(self, '_stream_capture_threads') and self._stream_capture_threads:
-                with self.stream_lock:
-                    for cam_name in self.rs_pipelines.keys():
-                        if cam_name in self.stream_frames:
-                            obs[cam_name] = self.stream_frames[cam_name].copy()
-                        else:
-                            obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
-            else:
-                # 스트리밍 안 할 때는 직접 캡처
-                try:
-                    import pyrealsense2 as rs
-                    for cam_name, (pipeline, _) in self.rs_pipelines.items():
-                        try:
-                            frames = pipeline.wait_for_frames(timeout_ms=100)
-                            color_frame = frames.get_color_frame()
-                            if color_frame:
-                                frame_rgb = np.asanyarray(color_frame.get_data())
-                                obs[cam_name] = frame_rgb
-                            else:
-                                obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
-                        except Exception:
-                            obs[cam_name] = np.zeros((480, 640, 3), dtype=np.uint8)
-                except Exception as e:
-                    pass  # 전체 카메라 실패시 무시
+            try:
+                import pyrealsense2 as rs
+                for cam_name, (pipeline, _) in self.rs_pipelines.items():
+                    try:
+                        frames = pipeline.wait_for_frames(timeout_ms=100)
+                        color_frame = frames.get_color_frame()
+                        if color_frame:
+                            frame_rgb = np.asanyarray(color_frame.get_data())
+                            obs[cam_name] = frame_rgb
+                            # 웹 스트리밍용 버퍼에 저장
+                            if self.stream_port > 0:
+                                with self.stream_lock:
+                                    self.stream_frames[cam_name] = frame_rgb.copy()
+                    except Exception:
+                        pass  # 개별 카메라 실패시 무시
+            except Exception as e:
+                pass  # 전체 카메라 실패시 무시
         elif self.camera is not None:
             # 일반 USB 카메라
             import cv2
@@ -2016,8 +2236,12 @@ class RBY1Recorder:
 
         return obs
 
+    # ========================================================================
+    # 섹션 18: EEF pose 계산 ☆ 신규
+    # ========================================================================
+    
     def _compute_eef_pose(self, q: np.ndarray, obs: dict):
-        """EEF pose 및 delta pose 계산"""
+        """EEF pose 및 delta pose 계산 ☆ 신규"""
         # 관절 각도 설정
         self.dyn_state.set_q(q)
         
@@ -2094,8 +2318,12 @@ class RBY1Recorder:
         
         return np.array([roll, pitch, yaw])
 
+    # ========================================================================
+    # 섹션 19: Feature 빌더 ☆ 신규 (LeRobot 형식)
+    # ========================================================================
+    
     def _get_state_dim(self) -> int:
-        """observation.state 벡터 차원 계산"""
+        """observation.state 벡터 차원 계산 ☆ 신규"""
         # 관절 수 + 그리퍼 수
         dim = len(self.joint_names)  # 관절 위치
         if self.arms in ["right", "both"]:
@@ -2105,7 +2333,7 @@ class RBY1Recorder:
         return dim
 
     def _get_state_names(self) -> list[str]:
-        """observation.state 벡터의 각 요소 이름"""
+        """observation.state 벡터의 각 요소 이름 ☆ 신규"""
         names = [f"{name}.pos" for name in self.joint_names]
         if self.arms in ["right", "both"]:
             names.append("right_gripper.pos")
@@ -2114,7 +2342,7 @@ class RBY1Recorder:
         return names
 
     def build_features(self, use_camera: bool = False, camera_shape: tuple = (480, 640, 3)) -> dict:
-        """데이터셋 feature 정의 생성 (LeRobot 표준 형식)"""
+        """데이터셋 feature 정의 생성 ☆ 신규 (LeRobot 표준 형식)"""
         features = {}
         
         state_dim = self._get_state_dim()
@@ -2189,6 +2417,10 @@ class RBY1Recorder:
 
         return features
 
+    # ========================================================================
+    # 섹션 20: record_episodes ☆ 신규 (메인 녹화 루프)
+    # ========================================================================
+    
     def record_episodes(
         self,
         output_name: str,
@@ -2197,7 +2429,7 @@ class RBY1Recorder:
         fps: int = 30,
         use_camera: bool = False,
     ):
-        """여러 에피소드 녹화 (키보드 제어)"""
+        """여러 에피소드 녹화 ☆ 신규"""
         print("\n" + "=" * 60)
         print(f"녹화 설정")
         print("=" * 60)
@@ -2550,7 +2782,7 @@ class RBY1Recorder:
         return dataset
 
     def _print_summary(self, output_name: str, num_episodes: int, total_frames: int, save_root: Path):
-        """녹화 완료 요약 출력"""
+        """녹화 완료 요약 출력 ☆ 신규"""
         print("\n" + "=" * 60)
         print("녹화 완료!")
         print("=" * 60)
@@ -2559,6 +2791,10 @@ class RBY1Recorder:
         print(f"  저장 경로: {save_root / output_name}")
         print("=" * 60)
 
+
+# ============================================================================
+# 섹션 21: main() 함수 ☆ 신규 (CLI 인터페이스)
+# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -2593,7 +2829,7 @@ def main():
                         help="로봇 주소 (기본: 192.168.30.1:50051)")
     parser.add_argument("--model", type=str, default="a", choices=["a", "m", "ub"],
                         help="로봇 모델 (기본: a)")
-    parser.add_argument("--arms", type=str, default="right", choices=["right", "left", "both"],
+    parser.add_argument("--arms", type=str, default="both", choices=["right", "left", "both"],
                         help="기록할 팔 선택: right, left, both (기본: right)")
     parser.add_argument("--teleop", action="store_true",
                         help="텔레오퍼레이션 모드: 마스터 암에서 action 기록 (기본: false)")

@@ -101,6 +101,27 @@ WHEEL_JOINTS = [
     "wheel_1",  # 오른쪽 휠
 ]
 
+# ============================================================================
+# RealSense 카메라 시리얼 번호 ↔ 이름 매핑
+# 시리얼 번호는 재부팅해도 변하지 않으므로 안정적인 매핑 가능
+# ============================================================================
+CAMERA_SERIAL_MAP = {
+    # D405 손목 카메라 (USB 연결 문제시 pyrealsense2에서 인식 안 될 수 있음)
+    "315122272205": "cam_left_wrist",   # D405 - 왼손
+    "335122271196": "cam_right_wrist",  # D405 - 오른손
+    # D435 헤드 카메라
+    "207522073093": "cam_high",         # D435 - 헤드
+}
+
+# 카메라 모델명으로 자동 감지 (시리얼 매핑이 없을 때 fallback)
+CAMERA_MODEL_MAP = {
+    "D435i": "cam_high",      # D435i는 헤드 카메라로 자동 할당
+    "D435": "cam_high",       # D435도 헤드로
+}
+
+# D405 손목 카메라 이름 (순서대로 할당됨)
+D405_CAMERA_NAMES = ["cam_right_wrist", "cam_left_wrist"]
+
 
 # ============================================================================
 # 텔레오퍼레이션 설정 (SDK에서 가져옴)
@@ -129,9 +150,9 @@ class TeleopSettings:
 # 초기 자세 (모델별)
 READY_POSE = {
     "A": {
-        "torso": np.deg2rad([0.0, 80.0, -140.0, 60.0, 0.0, 0.0]),
-        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 70.0, 0.0]),
-        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 70.0, 0.0] ),
+        "torso": np.deg2rad([0.0, 45.0, -90.0, 45.0, 0.0, 0.0]),
+        "right_arm": np.deg2rad([0.0, -5.0, 0.0, -120.0, 0.0, 50.0, 0.0]),
+        "left_arm": np.deg2rad([0.0, 5.0, 0.0, -120.0, 0.0, 50.0, 0.0] ),
         #"torso": np.array([0.0,1.1839635825151906,-1.4456515921713253,0.5552402935002304,0.0,0.0,]),
         #"right_arm": np.array([-0.015897964254646485,-1.6672738461993182,-0.3115309943159733,-1.1695426443162062,0.7229574754265632,-1.3463979472390455,0.0,]),
         #"left_arm": np.array([0.00019364608955982105,1.679986142431598,0.3165619956623804,-1.1723713960166389,-0.7150267947531944,-1.271152354641285,0.0,]),
@@ -263,7 +284,7 @@ class Gripper:
     def _control_loop(self):
         """그리퍼 제어 루프 (99_teleoperation과 동일)"""
         self.set_operating_mode(rby.DynamixelBus.CurrentBasedPositionControlMode)
-        self.bus.group_sync_write_send_torque([(dev_id, 5) for dev_id in [0, 1]])
+        self.bus.group_sync_write_send_torque([(dev_id, 0.5) for dev_id in [0, 1]])
         while self._running:
             if self.bus and self.target_q is not None:
                 try:
@@ -302,7 +323,7 @@ class RBY1Recorder:
     """RBY1 SDK를 사용한 LeRobot 형식 데이터 레코더"""
 
     def __init__(self, address: str, model: str = "a", camera_id: Optional[int] = None, 
-                 arms: str = "both", use_realsense: bool = False, use_teleop: bool = False,
+                 arms: str = "both", use_realsense: bool = True, use_teleop: bool = False,
                  camera_names: Optional[list] = None, stream_port: int = 0,
                  control_mode: str = "impedance", reset_pose: bool = True,
                  use_wheels: bool = False):
@@ -683,7 +704,7 @@ class RBY1Recorder:
         print(f"🌐 카메라 스트리밍: http://localhost:{self.stream_port}")
 
     def _connect_camera(self):
-        """카메라 연결 (멀티 RealSense 또는 일반 USB 카메라)"""
+        """카메라 연결 (멀티 RealSense 또는 일반 USB 카메라) - 자동 매핑"""
         # RealSense 카메라 시도 (멀티 카메라 지원)
         if self.use_realsense:
             try:
@@ -698,16 +719,40 @@ class RBY1Recorder:
                 else:
                     print(f"🔍 {len(devices)}개의 RealSense 카메라 감지됨")
                     
+                    unassigned_idx = 0  # 매핑 안 된 카메라용 인덱스
+                    d405_idx = 0  # D405 카메라 인덱스
+                    
                     # 각 카메라에 파이프라인 생성
-                    for i, device in enumerate(devices):
+                    for device in devices:
                         serial = device.get_info(rs.camera_info.serial_number)
-                        name = device.get_info(rs.camera_info.name)
+                        model_name = device.get_info(rs.camera_info.name)
                         
-                        # 카메라 이름 할당
-                        if i < len(self.camera_names):
-                            cam_name = self.camera_names[i]
+                        # 1. 시리얼 번호로 카메라 이름 결정 (최우선)
+                        if serial in CAMERA_SERIAL_MAP:
+                            cam_name = CAMERA_SERIAL_MAP[serial]
+                        # 2. D405 모델 처리 (손목 카메라)
+                        elif "D405" in model_name:
+                            if d405_idx < len(D405_CAMERA_NAMES):
+                                cam_name = D405_CAMERA_NAMES[d405_idx]
+                                d405_idx += 1
+                            else:
+                                cam_name = f"cam_wrist_{d405_idx}"
+                                d405_idx += 1
+                        # 3. 모델명으로 자동 감지 (D435i → cam_high)
+                        elif any(model in model_name for model in CAMERA_MODEL_MAP):
+                            for model, default_name in CAMERA_MODEL_MAP.items():
+                                if model in model_name:
+                                    # 이미 할당된 이름인지 확인
+                                    if default_name not in self.rs_pipelines:
+                                        cam_name = default_name
+                                    else:
+                                        cam_name = f"{default_name}_{unassigned_idx}"
+                                        unassigned_idx += 1
+                                    break
+                        # 4. 기본 이름 할당
                         else:
-                            cam_name = f"camera_{i}"
+                            cam_name = f"camera_{unassigned_idx}"
+                            unassigned_idx += 1
                         
                         try:
                             pipeline = rs.pipeline()
@@ -717,7 +762,7 @@ class RBY1Recorder:
                             
                             pipeline.start(config)
                             self.rs_pipelines[cam_name] = (pipeline, serial)
-                            print(f"  ✓ {cam_name}: {name} (S/N: {serial})")
+                            print(f"  ✓ {cam_name}: {model_name} (S/N: {serial})")
                         except Exception as e:
                             print(f"  ⚠ {cam_name} 초기화 실패: {e}")
                     
@@ -726,6 +771,11 @@ class RBY1Recorder:
                         first_name = list(self.rs_pipelines.keys())[0]
                         self.rs_pipeline = self.rs_pipelines[first_name][0]
                         print(f"✓ 총 {len(self.rs_pipelines)}개 RealSense 카메라 연결됨")
+                        
+                        # 매핑 요약 출력
+                        print("📷 카메라 매핑:")
+                        for cname, (_, cserial) in self.rs_pipelines.items():
+                            print(f"   {cname} ← S/N: {cserial}")
                     
                     if self.rs_pipelines:
                         return
@@ -908,8 +958,8 @@ class RBY1Recorder:
         if self.master_arm is not None:
             self.right_q = ready_pose["right_arm"].copy()
             self.left_q = ready_pose["left_arm"].copy()
-            self.right_minimum_time = 1.0
-            self.left_minimum_time = 1.0
+            self.right_minimum_time = 3.0
+            self.left_minimum_time = 3.0
         
         print("✓ 초기 자세 완료")
     
@@ -1026,7 +1076,7 @@ class RBY1Recorder:
         # 오른팔 마스터 암 제어
         if state.button_right.button == 1:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[0:7] = torque[0:7] * 0.6
+            ma_input.target_torque[0:7] = torque[0:7] * 0.6  # 17_teleop 원본과 동일
             self.right_q = np.array(state.q_joint[0:7])
         else:
             ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -1036,7 +1086,7 @@ class RBY1Recorder:
         # 왼팔 마스터 암 제어
         if state.button_left.button == 1:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
-            ma_input.target_torque[7:14] = torque[7:14] * 0.6
+            ma_input.target_torque[7:14] = torque[7:14] * 0.6  # 17_teleop 원본과 동일
             self.left_q = np.array(state.q_joint[7:14])
         else:
             ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
@@ -1528,7 +1578,7 @@ class RBY1Recorder:
         output_name: str,
         task: str,
         num_episodes: int = 1,
-        fps: int = 30,
+        fps: int = 15,
         use_camera: bool = False,
     ):
         """여러 에피소드 녹화 (키보드 제어)"""
@@ -1811,10 +1861,13 @@ class RBY1Recorder:
                         # 카메라 이미지 (멀티 카메라 지원)
                         if use_cam:
                             if self.rs_pipelines:
-                                # 멀티 RealSense 카메라
+                                # 멀티 RealSense 카메라 - 이미지 없으면 검은 이미지로 대체
                                 for cam_name in self.rs_pipelines.keys():
                                     if cam_name in raw_obs:
                                         frame[f"observation.images.{cam_name}"] = raw_obs[cam_name]
+                                    else:
+                                        # 카메라 이미지 획득 실패시 검은 이미지로 대체
+                                        frame[f"observation.images.{cam_name}"] = np.zeros((480, 640, 3), dtype=np.uint8)
                             elif "camera" in raw_obs:
                                 # 단일 USB 카메라
                                 frame["observation.images.camera"] = raw_obs["camera"]
