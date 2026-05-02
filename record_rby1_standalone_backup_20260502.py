@@ -115,13 +115,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 # 에피소드당 최대 시간 (초) - 5분
 MAX_EPISODE_DURATION = 300
 
-# RBY1-A 조인트 이름 (컴포넌트별로 분리)
-# SDK robot_joint_names 순서: wheel(0-1), torso(2-7), right_arm(8-14), left_arm(15-21), head(22-23)
-TORSO_JOINTS = [
-    "torso_0", "torso_1", "torso_2", "torso_3",
-    "torso_4", "torso_5",
-]
-
+# RBY1-A 조인트 이름 (팔별로 분리)
 RIGHT_ARM_JOINTS = [
     "right_arm_0", "right_arm_1", "right_arm_2", "right_arm_3",
     "right_arm_4", "right_arm_5", "right_arm_6",
@@ -132,14 +126,10 @@ LEFT_ARM_JOINTS = [
     "left_arm_4", "left_arm_5", "left_arm_6",
 ]
 
-HEAD_JOINTS = [
-    "head_0",  # 헤드 pan
-    "head_1",  # 헤드 tilt
-]
-
+# [개발중] 휠 조인트 이름
 WHEEL_JOINTS = [
-    "wheel_0",  # 오른쪽 휠 (right_wheel, SDK idx 0)
-    "wheel_1",  # 왼쪽 휠 (left_wheel, SDK idx 1)
+    "wheel_0",  # 왼쪽 휠
+    "wheel_1",  # 오른쪽 휠
 ]
 
 # ============================================================================
@@ -594,29 +584,19 @@ class RBY1Recorder:
         return []
 
     def _get_joint_names(self, arms: str) -> list[str]:
-        """선택한 팔에 따른 조인트 이름 반환
-        
-        전체 조인트 구성 (항상 포함):
-            torso (6) + arms (7 or 14) + head (2) + wheel (2)
-        """
-        # torso는 항상 포함
-        joints = TORSO_JOINTS.copy()
-        
-        # 팔 선택
+        """선택한 팔에 따른 조인트 이름 반환"""
         if arms == "right":
-            joints += RIGHT_ARM_JOINTS.copy()
+            joints = RIGHT_ARM_JOINTS.copy()
         elif arms == "left":
-            joints += LEFT_ARM_JOINTS.copy()
+            joints = LEFT_ARM_JOINTS.copy()
         elif arms == "both":
-            joints += RIGHT_ARM_JOINTS + LEFT_ARM_JOINTS
+            joints = RIGHT_ARM_JOINTS + LEFT_ARM_JOINTS
         else:
             raise ValueError(f"Invalid arms option: {arms}. Use 'right', 'left', or 'both'")
         
-        # head는 항상 포함
-        joints += HEAD_JOINTS.copy()
-        
-        # wheel은 항상 포함
-        joints += WHEEL_JOINTS.copy()
+        # [개발중] 휠 조인트 추가
+        if self.use_wheels:
+            joints = joints + WHEEL_JOINTS
         
         return joints
 
@@ -1873,14 +1853,7 @@ class RBY1Recorder:
         return ma_input
 
     def get_master_arm_action(self) -> dict | None:
-        """마스터 암에서 action 값 가져오기
-        
-        action 구성:
-            - torso: 현재 로봇 상태 (마스터 암으로 제어하지 않음)
-            - arms: 마스터 암 관절 위치 (제어 목표)
-            - head: 현재 로봇 상태
-            - wheel: 현재 로봇 상태
-        """
+        """마스터 암에서 action 값 가져오기"""
         if self.master_arm is None:
             return None
         
@@ -1896,57 +1869,28 @@ class RBY1Recorder:
         # 오른팔: [0:7], 왼팔: [7:14]
         ma_joints = np.array(state.q_joint)
         
-        # 현재 로봇 상태에서 torso, head, wheel 가져오기
-        with self.state_lock:
-            robot_state = self.latest_state
-        
-        robot_pos = np.array(robot_state.position) if robot_state is not None else np.zeros(24)
-        
-        # torso (항상 현재 로봇 상태 사용)
-        if self.robot_model is not None:
-            torso_indices = list(self.robot_model.torso_idx)
-            head_indices = list(self.robot_model.head_idx)
-            wheel_indices = list(self.robot_model.mobility_idx)
-        else:
-            torso_indices = list(range(2, 8))
-            head_indices = [22, 23]
-            wheel_indices = [0, 1]
-        
-        for i, name in enumerate(TORSO_JOINTS):
-            if i < len(torso_indices):
-                idx = torso_indices[i]
-                action[f"{name}.pos"] = float(robot_pos[idx]) if idx < len(robot_pos) else 0.0
-        
-        # arms (마스터 암에서 가져옴)
         if self.arms == "right":
-            for i, name in enumerate(RIGHT_ARM_JOINTS):
+            # 오른팔만
+            for i, name in enumerate(self.joint_names):
                 action[f"{name}.pos"] = float(ma_joints[i]) if i < 7 else 0.0
+            # 그리퍼: 트리거 값 (0-1000 -> 0-1 정규화)
             action["right_gripper.pos"] = float(state.button_right.trigger) / 1000.0
             
         elif self.arms == "left":
-            for i, name in enumerate(LEFT_ARM_JOINTS):
+            # 왼팔만
+            for i, name in enumerate(self.joint_names):
                 action[f"{name}.pos"] = float(ma_joints[7 + i]) if i < 7 else 0.0
             action["left_gripper.pos"] = float(state.button_left.trigger) / 1000.0
             
         else:  # both
-            for i, name in enumerate(RIGHT_ARM_JOINTS):
-                action[f"{name}.pos"] = float(ma_joints[i])
-            for i, name in enumerate(LEFT_ARM_JOINTS):
-                action[f"{name}.pos"] = float(ma_joints[7 + i])
+            # 양팔
+            for i, name in enumerate(self.joint_names):
+                if i < 7:  # 오른팔
+                    action[f"{name}.pos"] = float(ma_joints[i])
+                else:  # 왼팔
+                    action[f"{name}.pos"] = float(ma_joints[i])  # 7:14
             action["right_gripper.pos"] = float(state.button_right.trigger) / 1000.0
             action["left_gripper.pos"] = float(state.button_left.trigger) / 1000.0
-        
-        # head (현재 로봇 상태)
-        for i, name in enumerate(HEAD_JOINTS):
-            if i < len(head_indices):
-                idx = head_indices[i]
-                action[f"{name}.pos"] = float(robot_pos[idx]) if idx < len(robot_pos) else 0.0
-        
-        # wheel (현재 로봇 상태)
-        for i, name in enumerate(WHEEL_JOINTS):
-            if i < len(wheel_indices):
-                idx = wheel_indices[i]
-                action[f"{name}.pos"] = float(robot_pos[idx]) if idx < len(robot_pos) else 0.0
         
         return action
 
@@ -2103,39 +2047,15 @@ class RBY1Recorder:
             velocities = np.array(state.velocity)
             torques = np.array(state.torque)
 
-            # 전체 관절 인덱스 매핑: torso + arms + head + wheel
-            # SDK robot_joint_names 순서: wheel(0-1), torso(2-7), right_arm(8-14), left_arm(15-21), head(22-23)
-            joint_indices = []
-            
-            if self.robot_model is not None:
-                # torso (항상 포함)
-                joint_indices += list(self.robot_model.torso_idx)       # [2,3,4,5,6,7]
-                
-                # arms (선택)
-                if self.arms == "right":
-                    joint_indices += list(self.robot_model.right_arm_idx)   # [8..14]
-                elif self.arms == "left":
-                    joint_indices += list(self.robot_model.left_arm_idx)    # [15..21]
-                else:  # both
-                    joint_indices += list(self.robot_model.right_arm_idx)
-                    joint_indices += list(self.robot_model.left_arm_idx)
-                
-                # head (항상 포함)
-                joint_indices += list(self.robot_model.head_idx)       # [22,23]
-                
-                # wheel (항상 포함) — mobility_idx
-                joint_indices += list(self.robot_model.mobility_idx)   # [0,1]
-            else:
-                # fallback: 하드코딩 인덱스
-                joint_indices += list(range(2, 8))     # torso
-                if self.arms == "right":
-                    joint_indices += list(range(8, 15))
-                elif self.arms == "left":
-                    joint_indices += list(range(15, 22))
-                else:
-                    joint_indices += list(range(8, 15)) + list(range(15, 22))
-                joint_indices += [22, 23]              # head
-                joint_indices += [0, 1]                # wheel
+            # 선택한 팔의 관절 인덱스 가져오기
+            if self.arms == "right":
+                joint_indices = list(self.robot_model.right_arm_idx) if self.robot_model else list(range(6, 13))
+            elif self.arms == "left":
+                joint_indices = list(self.robot_model.left_arm_idx) if self.robot_model else list(range(13, 20))
+            else:  # both
+                right_idx = list(self.robot_model.right_arm_idx) if self.robot_model else list(range(6, 13))
+                left_idx = list(self.robot_model.left_arm_idx) if self.robot_model else list(range(13, 20))
+                joint_indices = right_idx + left_idx
 
             for i, name in enumerate(self.joint_names):
                 if i < len(joint_indices):
@@ -2144,6 +2064,29 @@ class RBY1Recorder:
                         obs[f"{name}.pos"] = float(positions[idx])
                         obs[f"{name}.vel"] = float(velocities[idx])
                         obs[f"{name}.torque"] = float(torques[idx])
+
+            # [개발중] 휠 데이터 수집
+            if self.use_wheels and self.robot_model is not None:
+                try:
+                    # 휠 인덱스 가져오기 (RBY1-A: wheel_0=22, wheel_1=23)
+                    wheel_indices = getattr(self.robot_model, 'wheel_idx', None)
+                    if wheel_indices is None:
+                        # 기본 인덱스 사용 (head 다음)
+                        wheel_indices = [22, 23]
+                    
+                    for i, wheel_name in enumerate(WHEEL_JOINTS):
+                        if i < len(wheel_indices):
+                            idx = wheel_indices[i]
+                            if idx < len(positions):
+                                obs[f"{wheel_name}.pos"] = float(positions[idx])
+                                obs[f"{wheel_name}.vel"] = float(velocities[idx])
+                                obs[f"{wheel_name}.torque"] = float(torques[idx])
+                except Exception as e:
+                    # 휠 데이터 수집 실패시 0으로 채움
+                    for wheel_name in WHEEL_JOINTS:
+                        obs[f"{wheel_name}.pos"] = 0.0
+                        obs[f"{wheel_name}.vel"] = 0.0
+                        obs[f"{wheel_name}.torque"] = 0.0
 
             # 그리퍼 상태 (Dynamixel 엔코더에서 읽어 0-1 정규화)
             # ★ 수정: tool_state는 Dynamixel 그리퍼를 반영하지 못해 항상 0이었음
@@ -2439,12 +2382,12 @@ class RBY1Recorder:
             cam_status = '비활성화'
         print(f"  카메라: {cam_status}")
         
-        # 전체 관절 기록 상태
-        n_torso = len(TORSO_JOINTS)
-        n_head = len(HEAD_JOINTS)
-        n_wheel = len(WHEEL_JOINTS)
-        n_arm = len(self.joint_names) - n_torso - n_head - n_wheel
-        print(f"  관절 구성: torso({n_torso}) + arms({n_arm}) + head({n_head}) + wheel({n_wheel}) = {len(self.joint_names)}개")
+        # [개발중] 휠 기록 상태
+        if self.use_wheels:
+            wheel_status = "✓ 활성화 [개발중]"
+        else:
+            wheel_status = "비활성화"
+        print(f"  휠 기록: {wheel_status}")
         
         # 초기 자세 리셋 상태
         if self.use_teleop and self.reset_pose_each_episode:
